@@ -1858,6 +1858,12 @@ EOF_SDDM
             log_warn 'SDDM: не удалось включить sddm.service'
             return 0
         fi
+    elif [[ "$(detect_init_system)" == openrc ]]; then
+        if run_optional_root rc-update add sddm default 2>/dev/null || run_optional_root rc-update add display-manager default 2>/dev/null; then
+            update_state_field SDDM_ENABLED_BY_LINKA true
+        else
+            log_warn 'SDDM: не удалось добавить sddm в rc-update'
+        fi
     fi
 
     log_ok 'SDDM настроен.'
