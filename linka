@@ -771,16 +771,12 @@ start_shell() {
     disown "$d_pid" 2>/dev/null || true
 
     local i
-    for i in 1 2 3 4 5; do
+    for i in {1..10}; do
         if shell_running; then
             return 0
         fi
         sleep 0.5
     done
-
-    if shell_running; then
-        return 0
-    fi
 
     log_warn "serpantinumd запущен, но статус shell пока не подтверждён ($bin)"
     return 0
