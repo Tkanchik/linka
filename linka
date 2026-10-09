@@ -1,0 +1,3744 @@
+#!/usr/bin/env bash
+# linka 4.9.0 — Serpantinum installer для Fedora/Gentoo
+
+set -Eeuo pipefail
+
+readonly LINKA_VERSION="4.9.0"
+readonly REPO_SLUG="ilyamiro/serpantinum"
+readonly WALLPAPER_REPO="https://github.com/ilyamiro/shell-wallpapers.git"
+readonly FONT_URL="https://github.com/ryanoasis/nerd-fonts/releases/latest/download/Iosevka.zip"
+readonly DEFAULT_FALLBACK_VERSION="2.0.0"
+# Шеллу нужны Quickshell.Networking/Bluetooth/Polkit — они появились в 0.2.
+readonly QUICKSHELL_MIN_VERSION="0.2.0"
+
+REPO_BRANCH="${SERPANTINUM_BRANCH:-master}"
+ACTIVE_REPO_BRANCH="$REPO_BRANCH"
+FORCE_UPDATE="${SERPANTINUM_FORCE_UPDATE:-0}"
+UPDATE_BACKUP_DIR=""
+CONFIG_BACKUP_DIR=""
+DEPLOY_OLD_COMMIT=""
+
+CACHE_BASE="${HOME}/serpantinum"
+PROJECT_ROOT=""
+DISTRO=""
+
+STATE_DIR="${QS_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/serpantinum}"
+STATE_FILE="$STATE_DIR/state"
+BACKUP_BASE="$HOME/.config/serpantinum-backups"
+TARGET_BASE="$HOME/.local/share/serpantinum"
+BIN_DIR="$HOME/.local/bin"
+CONFIG_DIR="$HOME/.config/serpantinum"
+CONFIG_FILE="$CONFIG_DIR/settings.json"
+OWNERSHIP_MARKER="$TARGET_BASE/.serpantinum-managed"
+SDDM_MANAGED_CONF="/etc/sddm.conf.d/linka-serpantinum.conf"
+SDDM_THEME_DIR="/usr/share/sddm/themes/material-you"
+FONT_SYSTEM_DIR="/usr/share/fonts/IosevkaNerdFont"
+USER_FONT_DIR="$HOME/.local/share/fonts/IosevkaNerdFont"
+
+LOCK_FILE="${XDG_RUNTIME_DIR:-/tmp}/linka-${UID}.lock"
+BACKUP_KEEP="${LINKA_BACKUP_KEEP:-5}"
+SUDO_KEEPALIVE_PID=""
+
+# Фоновое автообновление (linka auto ...)
+AUTO_MODE=0   # 1 — фоновый запуск: без TTY, sudo -n, пакеты шелла не доустанавливаются
+AUTO_CONF="$STATE_DIR/auto.conf"
+AUTO_LOG="$STATE_DIR/auto.log"
+AUTO_LOG_MAX=524288
+AUTO_PID_FILE="$STATE_DIR/auto.pid"
+AUTO_DAEMON_LOCK="${XDG_RUNTIME_DIR:-/tmp}/linka-auto-daemon-${UID}.lock"
+AUTO_UNIT_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
+AUTO_AUTOSTART_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/autostart/linka-auto.desktop"
+AUTO_SUDOERS_FILE="/etc/sudoers.d/linka-auto"
+AUTO_SLEEP_PID=""
+# Эти же аргументы пишутся в sudoers — менять только вместе, иначе sudo -n откажет.
+AUTO_DNF_APPLY=(-y upgrade --refresh)
+AUTO_EMERGE_SYNC=(--sync)
+AUTO_EMERGE_PRETEND=(--pretend --update --deep --newuse --with-bdeps=y @world)
+AUTO_EMERGE_APPLY=(--ask=n --quiet-build=y --update --deep --newuse --with-bdeps=y @world)
+
+REQUIRED_PKGS=() SDDM_PKGS=() OPTIONAL_PKGS=() BOOTSTRAP_TOOLS=() BOOTSTRAP_PKGS=()
+
+FAILED_PKGS=()
+INSTALL_STATE="fresh"
+MODE="install"
+IS_REINSTALL=false
+OLD_VERSION="" TARGET_VERSION="" OLD_COMMIT="unknown" TARGET_COMMIT="unknown"
+SELECTED_COMPOSITORS=()
+SELECTED_COMPOSITORS_SAVED=()
+INSTALL_FULL_WALLPAPERS=true
+OPT_SDDM=true
+
+RESET=$'\e[0m'; BOLD=$'\e[1m'; C_CYAN=$'\e[36m'
+
+log_info()  { printf '[INFO] %s\n' "$*"; }
+log_ok()    { printf '[OK] %s\n' "$*"; }
+log_warn()  { printf '[WARN] %s\n' "$*" >&2; return 0; }
+log_error() { printf '[ERROR] %s\n' "$*" >&2; return 0; }
+
+cleanup_terminal() {
+    if [[ -t 1 ]]; then
+        printf '\e[?25h' 2>/dev/null || true
+    fi
+    stty echo icanon 2>/dev/null || true
+    stop_sudo_keepalive
+    return 0
+}
+# EXIT — только чистка терминала. INT/TERM обязаны завершать скрипт,
+# иначе после Ctrl+C он продолжил бы выполнять следующие шаги.
+trap cleanup_terminal EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+on_error() {
+    local ec=$?
+    printf '[ERROR] Строка %s: %s (exit %s)\n' "${BASH_LINENO[0]:-?}" "${BASH_COMMAND:-?}" "$ec" >&2
+    exit "$ec"
+}
+trap on_error ERR
+
+require_not_root() {
+    if [[ "$EUID" -eq 0 ]]; then
+        log_error 'Не запускайте от root.'
+        exit 1
+    fi
+    return 0
+}
+
+require_command() {
+    if command -v "$1" >/dev/null 2>&1; then
+        return 0
+    fi
+    log_error "Не найдено: $1"
+    return 1
+}
+
+run_root() {
+    # В фоне пароль спросить некому — sudo -n падает сразу, а не виснет.
+    if [[ "$AUTO_MODE" == 1 ]]; then
+        sudo -n "$@"
+    else
+        sudo "$@"
+    fi
+}
+
+run_optional_root() {
+    if run_root "$@"; then
+        return 0
+    fi
+    log_warn "sudo $* не удалось"
+    return 1
+}
+
+# Долгая сборка (особенно emerge на Gentoo) может идти часы — за это время
+# sudo-тикет протухает, и следующий sudo снова спросит пароль посреди
+# установки. Поэтому на время работы держим тикет живым.
+start_sudo_keepalive() {
+    if [[ -n "$SUDO_KEEPALIVE_PID" ]]; then
+        return 0
+    fi
+
+    if ! sudo -v; then
+        log_warn 'sudo: не удалось получить права — шаги, требующие root, могут не выполниться.'
+        return 0
+    fi
+
+    (
+        trap - ERR EXIT INT TERM
+        local _i
+        while kill -0 "$$" 2>/dev/null; do
+            sudo -n -v 2>/dev/null || exit 0
+            # Ждём ~50 с короткими шагами: если linka завершилась (в том числе
+            # аварийно), цикл замечает это за секунды, а не через минуту.
+            for _i in 1 2 3 4 5 6 7 8 9 10; do
+                kill -0 "$$" 2>/dev/null || exit 0
+                sleep 5
+            done
+        done
+    ) >/dev/null 2>&1 &
+    SUDO_KEEPALIVE_PID=$!
+    disown "$SUDO_KEEPALIVE_PID" 2>/dev/null || true
+    return 0
+}
+
+stop_sudo_keepalive() {
+    if [[ -n "$SUDO_KEEPALIVE_PID" ]]; then
+        pkill -P "$SUDO_KEEPALIVE_PID" 2>/dev/null || true
+        kill "$SUDO_KEEPALIVE_PID" 2>/dev/null || true
+        SUDO_KEEPALIVE_PID=""
+    fi
+    return 0
+}
+
+# Два одновременных запуска linka портят state-файл и деплой друг друга.
+acquire_lock() {
+    if ! command -v flock >/dev/null 2>&1; then
+        return 0
+    fi
+
+    exec 9>"$LOCK_FILE" || return 0
+
+    if ! flock -n 9; then
+        log_error 'linka уже запущена в другом терминале. Дождитесь её завершения.'
+        exit 1
+    fi
+
+    return 0
+}
+
+release_lock() {
+    exec 9>&- 2>/dev/null || true
+    return 0
+}
+
+# Конец операции: отпускаем lock и sudo-тикет (в меню они не должны висеть).
+end_session() {
+    stop_sudo_keepalive
+    release_lock
+    return 0
+}
+
+init_optional_env() {
+    : "${XDG_CURRENT_DESKTOP:=}"
+    : "${DESKTOP_SESSION:=}"
+    : "${HYPRLAND_INSTANCE_SIGNATURE:=}"
+    : "${SWAYSOCK:=}"
+    return 0
+}
+init_optional_env
+
+# ---------- distro ----------
+# LINKA_OS_RELEASE — только для тестов (подмена /etc/os-release).
+detect_distro_backend() {
+    local osr="${LINKA_OS_RELEASE:-/etc/os-release}" id="" like=""
+
+    if [[ ! -r "$osr" ]]; then
+        return 0
+    fi
+
+    # В подоболочке, чтобы переменные os-release не попали в окружение скрипта.
+    id="$( (. "$osr" >/dev/null 2>&1; printf '%s' "${ID:-}") || true)"
+    like="$( (. "$osr" >/dev/null 2>&1; printf '%s' "${ID_LIKE:-}") || true)"
+
+    case "$id" in
+        fedora|gentoo)
+            printf '%s\n' "$id"
+            return 0
+            ;;
+    esac
+
+    case " $like " in
+        *' fedora '*)
+            printf 'fedora\n'
+            return 0
+            ;;
+        *' gentoo '*)
+            printf 'gentoo\n'
+            return 0
+            ;;
+    esac
+
+    return 0
+}
+
+# Списки пакетов зависят от дистрибутива, поэтому заполняются после его
+# определения (а не при загрузке файла — иначе --help не работал бы вне
+# Fedora/Gentoo).
+init_package_lists() {
+    if [[ "$DISTRO" == 'fedora' ]]; then
+        REQUIRED_PKGS=(
+            kitty cava zbar pavucontrol alsa-utils wl-clipboard fd-find ripgrep
+            cliphist jq socat inotify-tools pamixer brightnessctl ddcutil acpi iw
+            bluez libnotify NetworkManager lm_sensors bc pipewire wireplumber
+            pipewire-pulseaudio pipewire-alsa pulseaudio-libs python3 ImageMagick
+            wget file git psmisc ffmpeg-free fastfetch unzip python3-websockets
+            qt6-qtwebsockets qt6-qtmultimedia qt6-qt5compat grim playerctl
+            xdg-desktop-portal-gtk slurp wmctrl easyeffects nautilus qt5-qtwayland
+            qt5-qtquickcontrols qt5-qtquickcontrols2 qt6-qtwayland qt5ct qt6ct
+            wf-recorder adw-gtk3-theme
+            qt6-qtdeclarative qt6-qtsvg qt6-qtshadertools
+        )
+        SDDM_PKGS=(sddm qt6-qtdeclarative qt6-qtsvg)
+        OPTIONAL_PKGS=(quickshell matugen satty wl-gammarelay-rs)
+        BOOTSTRAP_TOOLS=(jq curl git unzip fc-list)
+        BOOTSTRAP_PKGS=(jq curl git unzip fontconfig)
+    else
+        # Атомы, которых нет ни в одном подключённом репозитории, отфильтровываются
+        # в gentoo_filter_atoms (с предупреждением), а не валят весь emerge.
+        # Часть категорий может отличаться между ревизиями дерева — поэтому для
+        # xdg-desktop-portal-gtk и qt6ct указаны оба варианта.
+        REQUIRED_PKGS=(
+            dev-vcs/git media-libs/zbar media-sound/pavucontrol media-sound/alsa-utils
+            gui-apps/wl-clipboard sys-apps/fd app-text/ripgrep gui-apps/cliphist
+            app-misc/jq net-misc/socat sys-fs/inotify-tools media-sound/pamixer
+            sys-apps/brightnessctl sys-apps/ddcutil sys-power/acpi net-wireless/iw
+            net-wireless/bluez x11-libs/libnotify net-misc/networkmanager
+            sys-apps/lm_sensors sys-devel/bc media-video/pipewire media-video/wireplumber
+            media-libs/libpulse dev-lang/python media-gfx/imagemagick net-misc/wget
+            sys-apps/file sys-process/psmisc media-video/ffmpeg sys-apps/fastfetch
+            app-arch/unzip dev-python/websockets dev-qt/qtwebsockets dev-qt/qtmultimedia
+            dev-qt/qt5compat gui-apps/grim media-sound/playerctl
+            sys-apps/xdg-desktop-portal-gtk x11-misc/xdg-desktop-portal-gtk
+            gui-apps/slurp x11-misc/wmctrl
+            media-sound/easyeffects gnome-base/nautilus dev-qt/qtwayland
+            gui-apps/qt6ct x11-misc/qt6ct
+            dev-qt/qtdeclarative dev-qt/qtsvg dev-qt/qtshadertools
+            media-video/wf-recorder x11-themes/adw-gtk-theme media-video/gpu-screen-recorder
+            x11-terms/kitty media-sound/cava gui-apps/quickshell media-gfx/matugen
+            media-gfx/satty gui-apps/wl-gammarelay-rs sys-power/power-profiles-daemon
+        )
+        SDDM_PKGS=(x11-misc/sddm dev-qt/qtdeclarative dev-qt/qtsvg)
+        OPTIONAL_PKGS=()
+        BOOTSTRAP_TOOLS=(jq curl git unzip fc-list)
+        BOOTSTRAP_PKGS=(app-misc/jq net-misc/curl dev-vcs/git app-arch/unzip media-libs/fontconfig)
+    fi
+
+    return 0
+}
+
+preflight() {
+    DISTRO="$(detect_distro_backend)"
+    if [[ -z "$DISTRO" ]]; then
+        log_error 'Только Fedora и Gentoo.'
+        exit 1
+    fi
+
+    require_not_root
+    init_package_lists
+    return 0
+}
+
+pkg_installed() {
+    local pkg="$1"
+
+    if [[ "$DISTRO" == 'fedora' ]]; then
+        if rpm -q "$pkg" >/dev/null 2>&1; then
+            return 0
+        fi
+        return 1
+    fi
+
+    # portageq есть всегда (sys-apps/portage); has_version как отдельная
+    # команда вне ebuild-окружения не существует.
+    if command -v portageq >/dev/null 2>&1; then
+        if portageq has_version / "$pkg" >/dev/null 2>&1; then
+            return 0
+        fi
+        return 1
+    fi
+
+    if command -v qlist >/dev/null 2>&1; then
+        if qlist -I "$pkg" >/dev/null 2>&1; then
+            return 0
+        fi
+        return 1
+    fi
+
+    return 2
+}
+
+comp_atom() {
+    if [[ "$DISTRO" == 'fedora' ]]; then
+        case "$1" in
+            hyprland) printf 'hyprland\n' ;;
+            niri)     printf 'niri\n' ;;
+            sway)     printf 'sway\n' ;;
+            *)        printf '%s\n' "$1" ;;
+        esac
+        return 0
+    fi
+
+    case "$1" in
+        hyprland) printf 'gui-wm/hyprland\n' ;;
+        niri)     printf 'gui-wm/niri\n' ;;
+        sway)     printf 'gui-wm/sway\n' ;;
+        *)        printf '%s\n' "$1" ;;
+    esac
+}
+
+# ---------- state ----------
+serialize_array() {
+    if [[ ${#SELECTED_COMPOSITORS[@]} -eq 0 ]]; then
+        printf ''
+        return 0
+    fi
+
+    local IFS=' '
+    printf '%s' "${SELECTED_COMPOSITORS[*]}"
+    return 0
+}
+
+state_get() {
+    if [[ ! -f "$STATE_FILE" ]]; then
+        return 0
+    fi
+
+    awk -F= -v k="$1" '$1==k{sub(/^[^=]*=/,""); print; exit}' "$STATE_FILE"
+    return 0
+}
+
+update_state_field() {
+    local key="$1"
+    local safe_value
+    local tmp
+
+    mkdir -p "$STATE_DIR"
+    safe_value="$(printf '%s' "$2" | tr '\n\r' '  ')"
+    tmp="$(mktemp "${STATE_DIR}/.state.XXXXXX")"
+
+    if [[ -f "$STATE_FILE" ]]; then
+        awk -F= -v k="$key" -v v="$safe_value" '
+            BEGIN{f=0}
+            $1==k{print k"="v; f=1; next}
+            {print}
+            END{if(!f) print k"="v}
+        ' "$STATE_FILE" > "$tmp"
+    else
+        printf '%s=%s\n' "$key" "$safe_value" > "$tmp"
+    fi
+
+    chmod 600 "$tmp"
+    mv -f "$tmp" "$STATE_FILE"
+    return 0
+}
+
+load_state() {
+    OLD_VERSION="$(state_get SERPANTINUM_VERSION || true)"
+    OLD_COMMIT="$(state_get SHELL_COMMIT || true)"
+    if [[ -z "$OLD_COMMIT" ]]; then
+        OLD_COMMIT="unknown"
+    fi
+
+    local saved v
+    saved="$(state_get SELECTED_COMPOSITORS || true)"
+    SELECTED_COMPOSITORS_SAVED=()
+    if [[ -n "$saved" ]]; then
+        read -r -a SELECTED_COMPOSITORS_SAVED <<< "$saved"
+    fi
+
+    v="$(state_get OPT_SDDM || true)"
+    if [[ "$v" == true || "$v" == false ]]; then
+        OPT_SDDM="$v"
+    fi
+
+    v="$(state_get INSTALL_FULL_WALLPAPERS || true)"
+    if [[ "$v" == true || "$v" == false ]]; then
+        INSTALL_FULL_WALLPAPERS="$v"
+    fi
+
+    return 0
+}
+
+# ---------- version ----------
+read_version_file() {
+    if [[ ! -f "$1" ]]; then
+        return 0
+    fi
+
+    grep -m1 -oE '[0-9]+(\.[0-9]+)+(-[0-9A-Za-z.]+)?' "$1" 2>/dev/null || true
+    return 0
+}
+
+get_installed_version() {
+    local ver
+    ver="$(state_get SERPANTINUM_VERSION || true)"
+
+    # $STATE_DIR/version — файл, который писала linka 3.x и пишет 4.x
+    if [[ -z "$ver" ]]; then
+        ver="$(read_version_file "$STATE_DIR/version")"
+    fi
+
+    if [[ -z "$ver" ]]; then
+        ver="$(read_version_file "$TARGET_BASE/src/version.txt")"
+    fi
+
+    if [[ -z "$ver" ]]; then
+        ver="$(read_version_file "$TARGET_BASE/version.txt")"
+    fi
+
+    if [[ -z "$ver" ]]; then
+        ver="$DEFAULT_FALLBACK_VERSION"
+    fi
+
+    printf '%s\n' "$ver"
+    return 0
+}
+
+get_installed_commit() {
+    local c
+    c="$(state_get SHELL_COMMIT || true)"
+
+    # Установка официальным install.sh или linka >= 4.7.1 пишет SERPANTINUM_COMMIT
+    if [[ -z "$c" && -f "$STATE_DIR/version" ]]; then
+        c="$(awk -F= '/^SERPANTINUM_COMMIT=/{gsub(/"/,"",$2); print $2; exit}' "$STATE_DIR/version" 2>/dev/null || true)"
+    fi
+
+    printf '%s\n' "${c:-unknown}"
+    return 0
+}
+
+fetch_remote_version() {
+    # $1 = URL
+    curl -fsSL --connect-timeout 10 --retry 2 "$1" 2>/dev/null \
+        | grep -m1 -oE '[0-9]+(\.[0-9]+)+(-[0-9A-Za-z.]+)?' || true
+    return 0
+}
+
+get_target_version() {
+    local root="$1"
+    local v=""
+    local branch="${ACTIVE_REPO_BRANCH:-${REPO_BRANCH:-master}}"
+    local base="https://raw.githubusercontent.com/${REPO_SLUG}"
+
+    v="$(read_version_file "$root/src/version.txt")"
+    if [[ -z "$v" ]]; then
+        v="$(read_version_file "$root/version.txt")"
+    fi
+
+    if command -v curl >/dev/null 2>&1; then
+        if [[ -z "$v" ]]; then v="$(fetch_remote_version "$base/${branch}/src/version.txt")"; fi
+        if [[ -z "$v" ]]; then v="$(fetch_remote_version "$base/HEAD/src/version.txt")"; fi
+        if [[ -z "$v" ]]; then v="$(fetch_remote_version "$base/${branch}/version.txt")"; fi
+        if [[ -z "$v" ]]; then v="$(fetch_remote_version "$base/HEAD/version.txt")"; fi
+    fi
+
+    if [[ -z "$v" || "$v" == null ]]; then
+        v="$DEFAULT_FALLBACK_VERSION"
+    fi
+
+    printf '%s\n' "$v"
+    return 0
+}
+
+get_target_commit() {
+    local c=""
+    local branch="${ACTIVE_REPO_BRANCH:-${REPO_BRANCH:-master}}"
+
+    if [[ -d "$1/.git" ]]; then
+        c="$(git -C "$1" rev-parse --short HEAD 2>/dev/null || true)"
+    fi
+
+    if [[ -z "$c" ]] && command -v curl >/dev/null 2>&1 && command -v jq >/dev/null 2>&1; then
+        c="$(curl -fsSL --connect-timeout 10 --retry 2 \
+            "https://api.github.com/repos/${REPO_SLUG}/commits/${branch}" 2>/dev/null \
+            | jq -r '.sha[:7] // empty' 2>/dev/null || true)"
+    fi
+
+    if [[ -z "$c" ]] && command -v curl >/dev/null 2>&1 && command -v jq >/dev/null 2>&1; then
+        c="$(curl -fsSL --connect-timeout 10 --retry 2 \
+            "https://api.github.com/repos/${REPO_SLUG}/commits/HEAD" 2>/dev/null \
+            | jq -r '.sha[:7] // empty' 2>/dev/null || true)"
+    fi
+
+    printf '%s\n' "${c:-unknown}"
+    return 0
+}
+
+mark_shell_state() {
+    update_state_field SERPANTINUM_VERSION "$TARGET_VERSION"
+    update_state_field SHELL_VERSION "$TARGET_VERSION"
+    update_state_field SHELL_COMMIT "$TARGET_COMMIT"
+    update_state_field SELECTED_COMPOSITORS "$(serialize_array)"
+    update_state_field OPT_SDDM "$OPT_SDDM"
+    update_state_field INSTALL_FULL_WALLPAPERS "$INSTALL_FULL_WALLPAPERS"
+    return 0
+}
+
+is_installed() {
+    # Установка linka 4.x
+    if [[ -f "$OWNERSHIP_MARKER" && -f "$STATE_FILE" ]]; then
+        return 0
+    fi
+
+    # Установка linka 3.x / ручная: нет marker и state, но файлы шелла на месте.
+    # Считаем её "current", чтобы update не превращался в полную переустановку
+    # с перезаписью пользовательских конфигов.
+    if [[ -f "$TARGET_BASE/bin/serpantinumd" || -d "$TARGET_BASE/src/quickshell" ]]; then
+        return 0
+    fi
+
+    return 1
+}
+
+detect_install_state() {
+    if is_installed; then
+        printf 'current\n'
+        return 0
+    fi
+    printf 'fresh\n'
+    return 0
+}
+
+# ---------- repo ----------
+protect_local_repo_changes() {
+    # Перед git reset --hard сохраняем локальные правки, а не теряем их.
+    local ts msg
+    if [[ -z "$(git -C "$CACHE_BASE" status --porcelain 2>/dev/null || true)" ]]; then
+        return 0
+    fi
+
+    ts="$(date +%Y%m%d_%H%M%S)"
+    msg="linka-auto-${ts}"
+
+    if git -c user.name=linka -c user.email=linka@localhost -C "$CACHE_BASE" \
+        stash push -u -m "$msg" >/dev/null 2>&1; then
+        log_warn "В $CACHE_BASE были локальные изменения — сохранены: git -C $CACHE_BASE stash list ($msg)"
+        return 0
+    fi
+
+    mkdir -p "$BACKUP_BASE"
+    if git -C "$CACHE_BASE" diff HEAD > "$BACKUP_BASE/repo-local-changes.${ts}.patch" 2>/dev/null; then
+        log_warn "В $CACHE_BASE были локальные изменения — diff сохранён в $BACKUP_BASE/repo-local-changes.${ts}.patch"
+    else
+        log_warn "В $CACHE_BASE есть локальные изменения, сохранить их не удалось"
+    fi
+
+    return 0
+}
+
+ensure_repo() {
+    require_command git
+
+    local ref="" branch="$REPO_BRANCH" b
+
+    if [[ ! -d "$CACHE_BASE/.git" ]]; then
+        if [[ -e "$CACHE_BASE" && -n "$(ls -A "$CACHE_BASE" 2>/dev/null || true)" ]]; then
+            mkdir -p "$BACKUP_BASE"
+            mv "$CACHE_BASE" "${BACKUP_BASE}/serpantinum-dir.$(date +%Y%m%d_%H%M%S)"
+        fi
+
+        mkdir -p "$CACHE_BASE"
+        git clone "https://github.com/${REPO_SLUG}.git" "$CACHE_BASE" || {
+            log_error 'Не удалось клонировать репозиторий.'
+            return 1
+        }
+    else
+        git -C "$CACHE_BASE" remote set-url origin "https://github.com/${REPO_SLUG}.git" || true
+        git -C "$CACHE_BASE" fetch --prune origin || log_warn 'git fetch не удался, использую локальное состояние репо'
+    fi
+
+    if [[ -n "$branch" ]] && git -C "$CACHE_BASE" show-ref --verify --quiet "refs/remotes/origin/$branch"; then
+        ref="origin/$branch"
+    else
+        ref="$(git -C "$CACHE_BASE" symbolic-ref -q --short refs/remotes/origin/HEAD 2>/dev/null || true)"
+
+        if [[ -z "$ref" ]]; then
+            for b in master main; do
+                if git -C "$CACHE_BASE" show-ref --verify --quiet "refs/remotes/origin/$b"; then
+                    ref="origin/$b"
+                    break
+                fi
+            done
+        fi
+    fi
+
+    if [[ -z "$ref" ]]; then
+        log_error 'Не удалось определить ветку обновления репозитория.'
+        return 1
+    fi
+
+    protect_local_repo_changes
+    git -C "$CACHE_BASE" reset --hard "$ref" || return 1
+
+    ACTIVE_REPO_BRANCH="${ref#origin/}"
+    PROJECT_ROOT="$CACHE_BASE"
+    # НЕ экспортировать SERPANTINUM_DIR: шелл унаследовал бы путь к git-клону
+    # и работал бы мимо задеплоенной (и запатченной) копии.
+
+    return 0
+}
+
+# bootstrap ДО ensure_repo: на чистой системе может не быть git/curl/jq
+prepare_environment() {
+    acquire_lock
+    start_sudo_keepalive
+    bootstrap_installer_deps
+    ensure_repo
+}
+
+# ---------- process ----------
+find_serpantinumd() {
+    local cand
+
+    cand="$(command -v serpantinumd 2>/dev/null || true)"
+    if [[ -n "$cand" && -x "$cand" ]]; then
+        printf '%s\n' "$cand"
+        return 0
+    fi
+
+    for cand in "$BIN_DIR/serpantinumd" "$TARGET_BASE/bin/serpantinumd"; do
+        if [[ -x "$cand" ]]; then
+            printf '%s\n' "$cand"
+            return 0
+        fi
+    done
+
+    return 1
+}
+
+# serpantinumd всегда должен брать пути из собственного расположения
+# (~/.local/share/serpantinum), а не из унаследованного окружения.
+run_serpantinumd() {
+    local bin="$1"
+    shift
+    # 9>&- 8>&-: шелл живёт долго и иначе унаследовал бы lock linka, из-за чего
+    # следующий запуск linka (в т.ч. фоновый) видел бы «уже запущена».
+    env -u SERPANTINUM_DIR -u QS_DIR -u MAIN_QML "$bin" "$@" 9>&- 8>&-
+}
+
+shell_running() {
+    if pgrep -f "$TARGET_BASE/src/quickshell" >/dev/null 2>&1; then
+        return 0
+    fi
+
+    if pgrep -x serpantinumd >/dev/null 2>&1; then
+        return 0
+    fi
+
+    if pgrep -f "$TARGET_BASE/bin/serpantinumd" >/dev/null 2>&1; then
+        return 0
+    fi
+
+    return 1
+}
+
+stop_shell() {
+    if ! shell_running; then
+        return 0
+    fi
+
+    local bin i
+    bin="$(find_serpantinumd || true)"
+
+    if [[ -n "$bin" ]]; then
+        if command -v timeout >/dev/null 2>&1; then
+            timeout 5 env -u SERPANTINUM_DIR -u QS_DIR -u MAIN_QML "$bin" stop >/dev/null 2>&1 || true
+        else
+            run_serpantinumd "$bin" stop >/dev/null 2>&1 || true
+        fi
+    fi
+
+    for i in 1 2 3 4 5; do
+        if ! shell_running; then
+            return 0
+        fi
+        sleep 1
+    done
+
+    pkill -f "$TARGET_BASE/src/quickshell" 2>/dev/null || true
+    pkill -x serpantinumd 2>/dev/null || true
+
+    for i in 1 2 3; do
+        if ! shell_running; then
+            return 0
+        fi
+        sleep 1
+    done
+
+    # Эскалация до SIGKILL — тоже строго по своим процессам. Глобальный
+    # pkill quickshell не используется: он убил бы чужие инстансы пользователя.
+    pkill -9 -f "$TARGET_BASE/src/quickshell" 2>/dev/null || true
+    pkill -9 -x serpantinumd 2>/dev/null || true
+
+    for i in 1 2 3; do
+        if ! shell_running; then
+            return 0
+        fi
+        sleep 1
+    done
+
+    return 1
+}
+
+start_shell() {
+    fc-cache -f >/dev/null 2>&1 || true
+    export PATH="$BIN_DIR:$PATH"
+
+    local bin
+    bin="$(find_serpantinumd || true)"
+
+    if [[ -z "$bin" ]]; then
+        log_warn 'serpantinumd не найден'
+        return 1
+    fi
+
+    if ! run_serpantinumd "$bin" start; then
+        log_warn "serpantinumd start не удался ($bin)"
+        return 1
+    fi
+
+    return 0
+}
+
+kill_serpantinum() {
+    log_info 'Остановка Serpantinum...'
+
+    stop_shell || true
+
+    pkill -9 -f "$TARGET_BASE/src/quickshell" 2>/dev/null || true
+    pkill -9 -x serpantinumd 2>/dev/null || true
+
+    sleep 1
+
+    if shell_running; then
+        log_warn 'Часть процессов жива'
+        return 1
+    fi
+
+    log_ok 'Остановлено.'
+    return 0
+}
+
+# ---------- deps ----------
+bootstrap_installer_deps() {
+    local missing=()
+    local i
+
+    for i in "${!BOOTSTRAP_TOOLS[@]}"; do
+        if ! command -v "${BOOTSTRAP_TOOLS[$i]}" >/dev/null 2>&1; then
+            missing+=("${BOOTSTRAP_PKGS[$i]}")
+        fi
+    done
+
+    if [[ ${#missing[@]} -eq 0 ]]; then
+        return 0
+    fi
+
+    log_info "Bootstrap: ${missing[*]}"
+
+    if [[ "$DISTRO" == 'fedora' ]]; then
+        run_root dnf install -y --skip-unavailable "${missing[@]}" || true
+    else
+        run_root emerge --ask=n "${missing[@]}" || true
+    fi
+
+    return 0
+}
+
+install_fonts() {
+    local target="$USER_FONT_DIR"
+    local cache zip
+    cache="${XDG_CACHE_HOME:-$HOME/.cache}/serpantinum-fonts"
+    zip="$cache/Iosevka.zip"
+
+    mkdir -p "$cache" "$target"
+
+    if ! compgen -G "$target/*.ttf" >/dev/null 2>&1; then
+        if command -v curl >/dev/null 2>&1 && command -v unzip >/dev/null 2>&1; then
+            log_info 'Шрифты Iosevka (может занять минуту на слабом канале)...'
+
+            if curl -fL --connect-timeout 15 --retry 3 "$FONT_URL" -o "$zip" &&
+               unzip -qo "$zip" -d "$cache/x"; then
+                find "$cache/x" -type f -iname '*.ttf' ! -iname '*Mono*.ttf' -exec cp -f {} "$target/" \;
+            else
+                log_warn 'Шрифты: не удалось скачать/распаковать'
+            fi
+        else
+            log_warn 'Шрифты: нет curl/unzip, пропускаю загрузку'
+        fi
+
+        rm -rf "$cache"
+    fi
+
+    fc-cache -f "$HOME/.local/share/fonts" >/dev/null 2>&1 || true
+
+    if compgen -G "$target/*.ttf" >/dev/null 2>&1; then
+        run_optional_root mkdir -p "$FONT_SYSTEM_DIR" || true
+        run_optional_root cp -f "$target"/*.ttf "$FONT_SYSTEM_DIR/" || true
+        run_optional_root fc-cache -f /usr/share/fonts >/dev/null 2>&1 || true
+    fi
+
+    return 0
+}
+
+# ---- Gentoo helpers ----
+gentoo_ensure_guru() {
+    # quickshell/matugen/satty/wl-gammarelay-rs живут в overlay guru
+    if [[ -f /var/db/repos/guru/profiles/repo_name ]]; then
+        return 0
+    fi
+
+    log_info 'Gentoo: подключаю overlay guru (зеркало)...'
+
+    if [[ -e /var/db/repos/guru ]]; then
+        run_root rm -rf /var/db/repos/guru || true
+    fi
+
+    run_root mkdir -p /var/db/repos /etc/portage/repos.conf || true
+
+    if run_root git clone --depth 1 https://github.com/gentoo-mirror/guru.git /var/db/repos/guru; then
+        if run_root tee /etc/portage/repos.conf/guru.conf >/dev/null <<'EOF_GURU'
+[guru]
+location = /var/db/repos/guru
+sync-type = git
+sync-uri = https://github.com/gentoo-mirror/guru.git
+auto-sync = yes
+EOF_GURU
+        then
+            log_ok 'guru подключён.'
+        else
+            log_warn 'guru: не удалось записать repos.conf'
+        fi
+    else
+        log_warn 'guru не подключился — quickshell/matugen могут не установиться.'
+    fi
+
+    return 0
+}
+
+gentoo_sync_tree() {
+    log_info 'Gentoo: emerge-webrsync...'
+    run_root emerge-webrsync || log_warn 'webrsync не удался'
+    return 0
+}
+
+# Печатает (по одному на строку) только те атомы, чьи каталоги есть хотя бы
+# в одном подключённом репозитории. Если пути репозиториев определить не
+# удалось — печатает все атомы как есть.
+gentoo_filter_atoms() {
+    local repo_paths=() out=() miss=()
+    local r rp atom c p found
+
+    if command -v portageq >/dev/null 2>&1; then
+        for r in $(portageq get_repos / 2>/dev/null || true); do
+            rp="$(portageq get_repo_path / "$r" 2>/dev/null || true)"
+            if [[ -n "$rp" ]]; then
+                repo_paths+=("$rp")
+            fi
+        done
+    fi
+
+    if [[ ${#repo_paths[@]} -eq 0 ]]; then
+        printf '%s\n' "$@"
+        return 0
+    fi
+
+    for atom in "$@"; do
+        c="${atom%%/*}"
+        p="${atom##*/}"
+        p="${p%%:*}"
+        found=0
+
+        for rp in "${repo_paths[@]}"; do
+            if [[ -d "$rp/$c/$p" ]]; then
+                found=1
+                break
+            fi
+        done
+
+        if [[ "$found" -eq 1 ]]; then
+            out+=("$atom")
+        else
+            miss+=("$atom")
+        fi
+    done
+
+    if [[ ${#miss[@]} -gt 0 ]]; then
+        log_warn "Gentoo: атомы не найдены в репозиториях и пропущены: ${miss[*]}"
+    fi
+
+    if [[ ${#out[@]} -gt 0 ]]; then
+        printf '%s\n' "${out[@]}"
+    else
+        printf '%s\n' "$@"
+    fi
+
+    return 0
+}
+
+gentoo_autounmask_resolve() {
+    local round_i
+
+    if [[ $# -eq 0 ]]; then
+        return 0
+    fi
+
+    for round_i in 1 2 3 4 5; do
+        if emerge --pretend "$@" >/dev/null 2>&1; then
+            return 0
+        fi
+
+        log_info "Gentoo: autounmask (круг $round_i)..."
+
+        # --autounmask-write кладёт изменения в ._cfg0000_* файлы;
+        # без etc-update они не применяются и цикл был бы бесполезен.
+        run_root emerge --pretend --autounmask=y --autounmask-write=y "$@" >/dev/null 2>&1 || true
+
+        if command -v etc-update >/dev/null 2>&1; then
+            run_root etc-update --automode -5 >/dev/null 2>&1 || true
+        fi
+    done
+
+    if emerge --pretend "$@" >/dev/null 2>&1; then
+        return 0
+    fi
+
+    return 1
+}
+
+# ---- Fedora helpers ----
+fedora_ensure_copr_plugin() {
+    if dnf copr --help >/dev/null 2>&1; then
+        return 0
+    fi
+
+    log_info 'Fedora: ставлю плагин dnf copr...'
+    run_root dnf install -y dnf5-plugins >/dev/null 2>&1 ||
+        run_root dnf install -y dnf-plugins-core >/dev/null 2>&1 ||
+        return 1
+
+    dnf copr --help >/dev/null 2>&1
+}
+
+# Версия quickshell (X.Y.Z) из `quickshell --version`; пусто, если не удалось.
+quickshell_version() {
+    quickshell --version 2>/dev/null | head -n1 | grep -oE '[0-9]+(\.[0-9]+)+' | head -n1 || true
+    return 0
+}
+
+# version_ge A B — истина, если версия A >= B (сравнение через sort -V).
+version_ge() {
+    [[ "$(printf '%s\n%s\n' "$2" "$1" | sort -V | head -n1)" == "$2" ]]
+}
+
+# Проверяет наличие и версию quickshell. Установку не прерывает, но проблема
+# попадает в FAILED_PKGS и выводится в итоговой сводке.
+check_quickshell() {
+    local ver f
+
+    if ! command -v quickshell >/dev/null 2>&1; then
+        log_error "quickshell не установлен — шелл не запустится (нужна версия ${QUICKSHELL_MIN_VERSION}+)."
+        if [[ ${#FAILED_PKGS[@]} -gt 0 ]]; then
+            for f in "${FAILED_PKGS[@]}"; do
+                if [[ "$f" == *quickshell* ]]; then
+                    return 0
+                fi
+            done
+        fi
+        FAILED_PKGS+=("quickshell>=${QUICKSHELL_MIN_VERSION}")
+        return 0
+    fi
+
+    ver="$(quickshell_version)"
+
+    if [[ -z "$ver" ]]; then
+        log_warn "quickshell: не удалось определить версию (нужна ${QUICKSHELL_MIN_VERSION}+) — проверьте вручную: quickshell --version"
+        return 0
+    fi
+
+    if version_ge "$ver" "$QUICKSHELL_MIN_VERSION"; then
+        log_info "quickshell: $ver (требуется ${QUICKSHELL_MIN_VERSION}+)"
+    else
+        log_error "quickshell $ver слишком старый: шеллу нужны Quickshell.Networking/Bluetooth/Polkit (версия ${QUICKSHELL_MIN_VERSION}+). Шелл не запустится — обновите quickshell."
+        FAILED_PKGS+=("quickshell>=${QUICKSHELL_MIN_VERSION}(установлен $ver)")
+    fi
+
+    return 0
+}
+
+install_dependencies() {
+    local compositors=("$@")
+    local target_list=()
+    local comp pkg
+
+    FAILED_PKGS=()
+
+    if [[ "$DISTRO" == 'fedora' ]]; then
+        for pkg in "${REQUIRED_PKGS[@]}"; do
+            # ffmpeg-free конфликтует с ffmpeg из RPM Fusion и валит транзакцию
+            if [[ "$pkg" == ffmpeg-free ]] && rpm -q ffmpeg >/dev/null 2>&1; then
+                log_info 'ffmpeg (RPM Fusion) уже установлен — пропускаю ffmpeg-free'
+                continue
+            fi
+            target_list+=("$pkg")
+        done
+
+        if ! rpm -q tuned-ppd >/dev/null 2>&1; then
+            target_list+=(power-profiles-daemon)
+        fi
+
+        if [[ "$OPT_SDDM" == true && ${#SDDM_PKGS[@]} -gt 0 ]]; then
+            target_list+=("${SDDM_PKGS[@]}")
+        fi
+
+        if fedora_ensure_copr_plugin; then
+            run_root dnf copr enable -y errornointernet/quickshell ||
+                log_warn 'COPR errornointernet/quickshell не включился — quickshell/matugen могут не поставиться'
+        else
+            log_warn 'Плагин dnf copr недоступен — quickshell/matugen из COPR не поставятся'
+        fi
+
+        log_info "Fedora: основные пакеты (${#target_list[@]})..."
+        run_root dnf install -y --skip-unavailable "${target_list[@]}" || log_warn 'Основная транзакция dnf не полная'
+
+        if [[ ${#OPTIONAL_PKGS[@]} -gt 0 ]]; then
+            for pkg in "${OPTIONAL_PKGS[@]}"; do
+                if ! pkg_installed "$pkg"; then
+                    run_root dnf install -y "$pkg" || log_warn "optional: $pkg недоступен"
+                fi
+            done
+        fi
+
+        if [[ ${#compositors[@]} -gt 0 ]]; then
+            for comp in "${compositors[@]}"; do
+                pkg="$(comp_atom "$comp")"
+                if ! pkg_installed "$pkg"; then
+                    run_root dnf install -y "$pkg" ||
+                        log_warn "compositor: $pkg не установлен (для hyprland проверьте COPR, например solopasha/hyprland)"
+                fi
+            done
+        fi
+
+        if ! command -v fd >/dev/null 2>&1 && command -v fdfind >/dev/null 2>&1; then
+            run_optional_root ln -sfn "$(command -v fdfind)" /usr/local/bin/fd || true
+        fi
+    else
+        target_list=("${REQUIRED_PKGS[@]}")
+
+        run_root mkdir -p /etc/portage/package.use || log_warn 'Gentoo: не удалось создать /etc/portage/package.use'
+
+        run_root tee /etc/portage/package.use/serpantinum >/dev/null <<'EOF_USE' || log_warn 'Gentoo: не удалось записать package.use/serpantinum'
+media-video/pipewire dbus extra
+dev-qt/qtmultimedia qml ffmpeg
+EOF_USE
+
+        gentoo_ensure_guru
+        gentoo_sync_tree
+
+        if [[ ${#compositors[@]} -gt 0 ]]; then
+            for comp in "${compositors[@]}"; do
+                target_list+=("$(comp_atom "$comp")")
+            done
+        fi
+
+        if [[ "$OPT_SDDM" == true && ${#SDDM_PKGS[@]} -gt 0 ]]; then
+            target_list+=("${SDDM_PKGS[@]}")
+        fi
+
+        local filtered=()
+        mapfile -t filtered < <(gentoo_filter_atoms "${target_list[@]}")
+        if [[ ${#filtered[@]} -gt 0 ]]; then
+            target_list=("${filtered[@]}")
+        fi
+
+        if ! gentoo_autounmask_resolve "${target_list[@]}"; then
+            log_warn 'Gentoo: autounmask не завершился чисто'
+        fi
+
+        run_root emerge --ask=n --newuse --autounmask-continue "${target_list[@]}" || log_warn 'Gentoo: emerge не полный'
+    fi
+
+    for pkg in "${target_list[@]}"; do
+        if ! pkg_installed "$pkg"; then
+            FAILED_PKGS+=("$pkg")
+        fi
+    done
+
+    check_quickshell
+
+    if [[ ${#FAILED_PKGS[@]} -eq 0 ]]; then
+        log_ok 'Зависимости установлены.'
+    else
+        log_warn "Не установлены: ${FAILED_PKGS[*]}"
+    fi
+
+    return 0
+}
+
+# ---------- services ----------
+detect_init_system() {
+    local p
+
+    # LINKA_INIT_SYSTEM — только для тестов.
+    if [[ -n "${LINKA_INIT_SYSTEM:-}" ]]; then
+        printf '%s\n' "$LINKA_INIT_SYSTEM"
+        return 0
+    fi
+    p="$(ps -p 1 -o comm= 2>/dev/null || true)"
+
+    if [[ "$p" == systemd && -d /run/systemd/system ]]; then
+        printf 'systemd\n'
+        return 0
+    fi
+
+    if [[ -d /run/openrc || "$p" == openrc-init ]]; then
+        printf 'openrc\n'
+        return 0
+    fi
+
+    printf 'generic\n'
+    return 0
+}
+
+setup_services() {
+    local is
+    is="$(detect_init_system)"
+
+    if [[ "$is" == systemd ]]; then
+        run_root systemctl --global enable pipewire wireplumber pipewire-pulse || true
+        systemctl --user start pipewire wireplumber pipewire-pulse || true
+        systemctl --user enable --now easyeffects.service || true
+        run_root systemctl enable --now NetworkManager.service || true
+    elif [[ "$is" == openrc ]]; then
+        run_optional_root rc-update add NetworkManager default || true
+        run_optional_root rc-service NetworkManager start || true
+    fi
+
+    return 0
+}
+
+# ---------- wallpapers ----------
+get_wallpaper_dir() {
+    local u=''
+
+    if [[ -f "$HOME/.config/user-dirs.dirs" ]]; then
+        u="$(sed -n 's/^XDG_PICTURES_DIR="\(.*\)"/\1/p' "$HOME/.config/user-dirs.dirs" | head -n1)"
+        u="${u//\$HOME/$HOME}"
+    fi
+
+    if [[ -z "$u" || "$u" == "$HOME" ]] && command -v xdg-user-dir >/dev/null 2>&1; then
+        u="$(xdg-user-dir PICTURES 2>/dev/null || true)"
+    fi
+
+    if [[ -z "$u" || "$u" == "$HOME" ]]; then
+        u="$HOME/Pictures"
+    fi
+
+    printf '%s/Wallpapers\n' "${u%/}"
+    return 0
+}
+
+install_wallpapers() {
+    local full="${1:-true}"
+    local dir clone src ok=false
+    dir="$(get_wallpaper_dir)"
+    clone="${XDG_CACHE_HOME:-$HOME/.cache}/serpantinum-wallpapers"
+
+    mkdir -p "$dir"
+
+    if [[ -d "$clone/.git" ]] &&
+       git -C "$clone" fetch --depth 1 origin &&
+       git -C "$clone" reset --hard FETCH_HEAD; then
+        ok=true
+    fi
+
+    if [[ "$ok" != true ]]; then
+        rm -rf "$clone"
+        if ! git clone --depth 1 "$WALLPAPER_REPO" "$clone"; then
+            log_warn 'Обои: клон не удался (сеть)'
+            return 0
+        fi
+    fi
+
+    src="$clone"
+    if [[ -d "$clone/images" ]]; then
+        src="$clone/images"
+    fi
+
+    if [[ ! -d "$src" ]]; then
+        return 0
+    fi
+
+    local files=() f
+
+    if [[ "$full" == true ]]; then
+        while IFS= read -r -d '' f; do
+            files+=("$f")
+        done < <(find "$src" -type f \( -iname '*.jpg' -o -iname '*.jpeg' -o -iname '*.png' -o -iname '*.gif' -o -iname '*.webp' \) -print0)
+    else
+        if command -v shuf >/dev/null 2>&1; then
+            while IFS= read -r -d '' f; do
+                files+=("$f")
+            done < <(find "$src" -type f \( -iname '*.jpg' -o -iname '*.png' -o -iname '*.webp' \) -print0 | shuf -z -n 3)
+        else
+            while IFS= read -r -d '' f; do
+                files+=("$f")
+            done < <(find "$src" -type f \( -iname '*.jpg' -o -iname '*.png' -o -iname '*.webp' \) -print0 | head -z -n 3)
+        fi
+    fi
+
+    if [[ ${#files[@]} -eq 0 ]]; then
+        log_warn 'Обои: файлов не найдено'
+        return 0
+    fi
+
+    for f in "${files[@]}"; do
+        cp -f "$f" "$dir/" 2>/dev/null || true
+    done
+
+    log_ok "Обои: ${#files[@]} файлов."
+    return 0
+}
+
+# ---------- deploy ----------
+ensure_ownership_marker() {
+    mkdir -p "$TARGET_BASE"
+
+    if [[ ! -f "$OWNERSHIP_MARKER" ]]; then
+        printf 'owner=linka\nversion=%s\nrepo=%s\n' "$LINKA_VERSION" "$REPO_SLUG" > "$OWNERSHIP_MARKER"
+    fi
+
+    return 0
+}
+
+get_compositor_config_dir_name() {
+    case "$1" in
+        hyprland) printf 'hypr\n' ;;
+        niri)     printf 'niri\n' ;;
+        sway)     printf 'sway\n' ;;
+        *)        printf '%s\n' "$1" ;;
+    esac
+}
+
+# Бэкап одного каталога/файла из ~/.config перед перезаписью.
+backup_user_config() {
+    local name="$1"
+    local path="$HOME/.config/$name"
+
+    if [[ ! -e "$path" ]]; then
+        return 0
+    fi
+
+    if [[ -d "$path" && -z "$(ls -A "$path" 2>/dev/null || true)" ]]; then
+        return 0
+    fi
+
+    if [[ -z "$CONFIG_BACKUP_DIR" ]]; then
+        CONFIG_BACKUP_DIR="$BACKUP_BASE/configs.$(date +%Y%m%d_%H%M%S)"
+        mkdir -p "$CONFIG_BACKUP_DIR" || return 0
+    fi
+
+    if cp -a "$path" "$CONFIG_BACKUP_DIR/" 2>/dev/null; then
+        log_info "Бэкап ~/.config/$name → $CONFIG_BACKUP_DIR/"
+    else
+        log_warn "Не удалось сделать бэкап ~/.config/$name"
+    fi
+
+    return 0
+}
+
+deploy_compositor_config() {
+    local repo="$1"
+    local c="$2"
+    local dn src tgt
+
+    dn="$(get_compositor_config_dir_name "$c")"
+    src=''
+
+    if [[ -d "$repo/compositors/$c" ]]; then
+        src="$repo/compositors/$c"
+    fi
+
+    if [[ -z "$src" && -d "$repo/compositor/$c" ]]; then
+        src="$repo/compositor/$c"
+    fi
+
+    if [[ -z "$src" ]]; then
+        return 0
+    fi
+
+    tgt="$HOME/.config/$dn"
+    backup_user_config "$dn"
+    mkdir -p "$tgt"
+    cp -a "$src/." "$tgt/"
+    log_ok "Конфиг $c развёрнут в ~/.config/$dn"
+
+    return 0
+}
+
+# Удаляет из TARGET_BASE файлы bin/ и src/, которые были в старом коммите
+# и исчезли в HEAD (в том числе при смене ветки). Трогаем только то, что
+# раньше отслеживалось git, поэтому рантайм-файлы шелла не пострадают.
+# Возвращает 1, если сравнить коммиты не удалось.
+prune_removed_files() {
+    local repo="$1"
+    local oc="$2"
+    local f deleted_tmp removed=0
+
+    if [[ -z "$oc" || "$oc" == unknown || ! -d "$repo/.git" ]]; then
+        return 1
+    fi
+
+    if ! git -C "$repo" cat-file -e "${oc}^{commit}" 2>/dev/null; then
+        return 1
+    fi
+
+    deleted_tmp="$(mktemp)" || return 1
+
+    if ! git -C "$repo" diff -z --name-only --no-renames --diff-filter=D "$oc" HEAD -- bin src > "$deleted_tmp" 2>/dev/null; then
+        rm -f "$deleted_tmp"
+        return 1
+    fi
+
+    while IFS= read -r -d '' f; do
+        if [[ -e "$TARGET_BASE/$f" || -L "$TARGET_BASE/$f" ]]; then
+            rm -f "$TARGET_BASE/$f"
+            removed=$((removed+1))
+        fi
+    done < "$deleted_tmp"
+
+    rm -f "$deleted_tmp"
+
+    # Пустые каталоги после удаления файлов убираем (сами bin/ и src/ не трогаем).
+    if [[ "$removed" -gt 0 ]]; then
+        find "$TARGET_BASE/bin" "$TARGET_BASE/src" -mindepth 1 -type d -empty -delete 2>/dev/null || true
+        log_info "Удалено устаревших файлов (были в старой версии, нет в новой): $removed"
+    fi
+
+    return 0
+}
+
+# Инкрементальное обновление как в официальном deploy.sh: копируем только
+# изменённые между OLD_COMMIT и HEAD файлы bin/ и src/, удалённые — удаляем.
+# Возвращает 1, если инкрементальный путь невозможен (тогда делается полный cp).
+deploy_incremental() {
+    local repo="$1"
+    local oc="$2"
+    local f
+
+    if [[ "$FORCE_UPDATE" == 1 || -z "$oc" || "$oc" == unknown || ! -d "$repo/.git" ]]; then
+        return 1
+    fi
+
+    if [[ ! -d "$TARGET_BASE/src" ]]; then
+        return 1
+    fi
+
+    if ! git -C "$repo" cat-file -e "${oc}^{commit}" 2>/dev/null; then
+        return 1
+    fi
+
+    local changed_tmp
+    changed_tmp="$(mktemp)" || return 1
+
+    if ! git -C "$repo" diff -z --name-only --no-renames --diff-filter=AM "$oc" HEAD -- bin src > "$changed_tmp" 2>/dev/null; then
+        rm -f "$changed_tmp"
+        return 1
+    fi
+
+    prune_removed_files "$repo" "$oc" || {
+        rm -f "$changed_tmp"
+        return 1
+    }
+
+    local cp_failed=0
+
+    while IFS= read -r -d '' f; do
+        if ! mkdir -p "$(dirname "$TARGET_BASE/$f")" ||
+           ! cp -a "$repo/$f" "$TARGET_BASE/$f"; then
+            cp_failed=1
+            log_warn "Не удалось скопировать: $f"
+            continue
+        fi
+
+        if [[ "$f" == bin/* || "$f" == *.sh ]]; then
+            chmod +x "$TARGET_BASE/$f" 2>/dev/null || true
+        fi
+    done < "$changed_tmp"
+
+    rm -f "$changed_tmp"
+
+    if [[ "$cp_failed" -eq 1 ]]; then
+        log_warn 'Инкрементальное обновление прошло с ошибками — перехожу на полное копирование'
+        return 1
+    fi
+
+    log_info "Инкрементальное обновление: $oc → $(git -C "$repo" rev-parse --short HEAD 2>/dev/null || echo HEAD)"
+    return 0
+}
+
+# Полное копирование bin/ и src/ из репо в target.
+copy_tree_full() {
+    local repo="$1"
+
+    if [[ -d "$repo/bin" ]]; then
+        cp -a "$repo/bin/." "$TARGET_BASE/bin/" || return 1
+    fi
+
+    if [[ -d "$repo/src" ]]; then
+        cp -a "$repo/src/." "$TARGET_BASE/src/" || return 1
+    fi
+
+    if [[ -f "$repo/version.txt" ]]; then
+        cp -a "$repo/version.txt" "$TARGET_BASE/version.txt" 2>/dev/null || true
+    fi
+
+    return 0
+}
+
+fix_exec_bits() {
+    find "$TARGET_BASE/src" -type f -name '*.sh' -exec chmod +x {} + 2>/dev/null || true
+    find "$TARGET_BASE/bin" -type f -exec chmod +x {} + 2>/dev/null || true
+    return 0
+}
+
+# Проверка целостности после деплоя: ключевые бинарники на месте и
+# исполняемые, каталог quickshell есть, а каждый отслеживаемый git'ом файл
+# bin/ и src/ присутствует в target.
+verify_deploy() {
+    local repo="$1"
+    local f rel bad=0 missing=0
+
+    for rel in bin/serpantinumd bin/serpantinum; do
+        if [[ -f "$repo/$rel" && ! -x "$TARGET_BASE/$rel" ]]; then
+            log_warn "Проверка деплоя: $rel отсутствует или не исполняемый"
+            bad=1
+        fi
+    done
+
+    if [[ -d "$repo/src/quickshell" && ! -d "$TARGET_BASE/src/quickshell" ]]; then
+        log_warn 'Проверка деплоя: нет каталога src/quickshell'
+        bad=1
+    fi
+
+    if [[ -d "$repo/.git" ]]; then
+        while IFS= read -r -d '' f; do
+            if [[ ! -e "$TARGET_BASE/$f" && ! -L "$TARGET_BASE/$f" ]]; then
+                missing=$((missing+1))
+                if [[ "$missing" -le 5 ]]; then
+                    log_warn "Проверка деплоя: нет файла $f"
+                fi
+            fi
+        done < <(git -C "$repo" ls-files -z -- bin src 2>/dev/null)
+    fi
+
+    if [[ "$missing" -gt 0 ]]; then
+        log_warn "Проверка деплоя: не хватает файлов: $missing"
+        bad=1
+    fi
+
+    if [[ "$bad" -ne 0 ]]; then
+        return 1
+    fi
+
+    return 0
+}
+
+deploy_full() {
+    local repo="$1"
+    local is_update="$2"
+    shift 2
+
+    local comps=("$@")
+    local c src tgt dn backup_dir
+
+    CONFIG_BACKUP_DIR=""
+
+    if [[ ! -d "$repo" ]]; then
+        return 1
+    fi
+
+    if [[ ! -d "$repo/bin" && ! -d "$repo/src" ]]; then
+        log_error 'В репозитории нет каталогов bin/ и src/.'
+        return 1
+    fi
+
+    if [[ "$is_update" == true ]]; then
+        # Безопасное обновление: не сносим target, только обновляем поверх.
+        # Файлы, удалённые в новой версии репозитория (или при смене ветки),
+        # убирает prune_removed_files — по разнице старого и нового коммита.
+        mkdir -p "$TARGET_BASE/bin" "$TARGET_BASE/src" "$BIN_DIR"
+        ensure_ownership_marker
+    else
+        # Fresh install / reinstall: убираем старый target, но предварительно бэкапим.
+        if [[ -e "$TARGET_BASE" ]]; then
+            mkdir -p "$BACKUP_BASE"
+            backup_dir="${BACKUP_BASE}/target.$(date +%Y%m%d_%H%M%S)"
+
+            if ! mv "$TARGET_BASE" "$backup_dir"; then
+                log_warn "Не удалось переместить старый $TARGET_BASE в $backup_dir, пробую rm -rf"
+                rm -rf "$TARGET_BASE" || return 1
+            fi
+        fi
+
+        mkdir -p "$TARGET_BASE/bin" "$TARGET_BASE/src" "$BIN_DIR"
+        ensure_ownership_marker
+    fi
+
+    local incremental_ok=false
+
+    if [[ "$is_update" == true ]] && deploy_incremental "$repo" "$DEPLOY_OLD_COMMIT"; then
+        incremental_ok=true
+    else
+        copy_tree_full "$repo" || return 1
+
+        if [[ "$is_update" == true ]]; then
+            if ! prune_removed_files "$repo" "$DEPLOY_OLD_COMMIT"; then
+                log_warn 'Не удалось определить устаревшие файлы (старый коммит недоступен) — в target могли остаться лишние файлы; чтобы убрать их, выполните linka reinstall.'
+            fi
+        fi
+    fi
+
+    fix_exec_bits
+
+    if ! verify_deploy "$repo"; then
+        if [[ "$incremental_ok" == true ]]; then
+            log_warn 'Проверка после инкрементального обновления не прошла — делаю полное копирование.'
+            copy_tree_full "$repo" || return 1
+            fix_exec_bits
+
+            if ! verify_deploy "$repo"; then
+                log_error 'Деплой не прошёл проверку целостности.'
+                return 1
+            fi
+        else
+            log_error 'Деплой не прошёл проверку целостности.'
+            return 1
+        fi
+    fi
+
+    if [[ "$is_update" != true ]]; then
+        # Fresh/reinstall: перезаписываем пользовательские конфиги, но с бэкапом.
+        for c in kitty cava fastfetch; do
+            src="$repo/config/$c"
+            tgt="$HOME/.config/$c"
+
+            if [[ -e "$src" ]]; then
+                backup_user_config "$c"
+                mkdir -p "$(dirname "$tgt")"
+
+                if [[ -d "$src" ]]; then
+                    mkdir -p "$tgt"
+                    cp -a "$src/." "$tgt/"
+                else
+                    cp -a "$src" "$tgt"
+                fi
+            fi
+        done
+
+        if [[ ${#comps[@]} -gt 0 ]]; then
+            for c in "${comps[@]}"; do
+                deploy_compositor_config "$repo" "$c"
+            done
+        fi
+    else
+        # Update: существующие конфиги не трогаем, но конфиг композитора,
+        # которого ещё нет (новый выбор в меню), разворачиваем.
+        if [[ ${#comps[@]} -gt 0 ]]; then
+            for c in "${comps[@]}"; do
+                dn="$(get_compositor_config_dir_name "$c")"
+                tgt="$HOME/.config/$dn"
+
+                if [[ ! -d "$tgt" || -z "$(ls -A "$tgt" 2>/dev/null || true)" ]]; then
+                    deploy_compositor_config "$repo" "$c"
+                fi
+            done
+        fi
+    fi
+
+    return 0
+}
+
+deploy_package() {
+    local repo="$1"
+    local oc="$2"
+    local nc="$3"
+    local rei="$4"
+    local ist="$5"
+    shift 5
+
+    local comps=("$@")
+    local iu=false
+
+    : "$nc"
+    DEPLOY_OLD_COMMIT="$oc"
+
+    if [[ "$ist" == current && "$rei" != true ]]; then
+        iu=true
+    fi
+
+    if [[ ${#comps[@]} -gt 0 ]]; then
+        deploy_full "$repo" "$iu" "${comps[@]}" || return 1
+    else
+        deploy_full "$repo" "$iu" || return 1
+    fi
+
+    if [[ -f "$TARGET_BASE/bin/serpantinum" ]]; then
+        ln -sfn "$TARGET_BASE/bin/serpantinum" "$BIN_DIR/serpantinum"
+        run_optional_root ln -sfn "$TARGET_BASE/bin/serpantinum" /usr/local/bin/serpantinum || true
+    fi
+
+    if [[ -f "$TARGET_BASE/bin/serpantinumd" ]]; then
+        ln -sfn "$TARGET_BASE/bin/serpantinumd" "$BIN_DIR/serpantinumd"
+        run_optional_root ln -sfn "$TARGET_BASE/bin/serpantinumd" /usr/local/bin/serpantinumd || true
+    fi
+
+    return 0
+}
+
+# ---------- matugen compat ----------
+# 0 = флаг поддерживается, 1 = не поддерживается, 2 = неизвестно (matugen не стоит)
+matugen_supports_source_color_index() {
+    local help
+
+    if ! command -v matugen >/dev/null 2>&1; then
+        return 2
+    fi
+
+    help="$(matugen image --help 2>&1 || true)"
+
+    if [[ -z "$help" ]]; then
+        return 2
+    fi
+
+    if grep -q -- '--source-color-index' <<< "$help"; then
+        return 0
+    fi
+
+    return 1
+}
+
+fix_matugen_compat() {
+    # Автоматически: правим только то, что реально сломано в текущей связке
+    # matugen + Matugen.qml. Полностью отключить: SERPANTINUM_MATUGEN_COMPAT=0
+    if [[ "${SERPANTINUM_MATUGEN_COMPAT:-auto}" == "0" ]]; then
+        return 0
+    fi
+
+    local qml="$TARGET_BASE/src/quickshell/singletons/theme/Matugen.qml"
+    local cfg="$TARGET_BASE/src/assets/matugen/config.toml"
+    local tpl="$TARGET_BASE/src/assets/matugen/templates"
+    local rc=0
+
+    # 1) Флаг --source-color-index: удаляем только если matugen его не знает
+    #    (иначе каждая генерация из GUI падает с кодом 2).
+    matugen_supports_source_color_index || rc=$?
+
+    if [[ "$rc" -eq 1 && -f "$qml" ]] && grep -q 'source-color-index' "$qml"; then
+        local qml_bak="${qml}.linka-bak"
+        cp -a "$qml" "$qml_bak" 2>/dev/null || true
+
+        if sed -i '/source-color-index/d' "$qml"; then
+            log_ok 'Matugen: убран флаг --source-color-index (не поддерживается установленным matugen)'
+        else
+            mv -f "$qml_bak" "$qml" 2>/dev/null || true
+            log_warn 'Не удалось безопасно применить matugen QML compat'
+        fi
+    fi
+
+    # 2) Относительные пути шаблонов в config.toml → абсолютные
+    #    (шелл вызывает matugen не из каталога matugen).
+    if [[ -f "$cfg" && -d "$tpl" ]] && grep -q 'input_path = "templates/' "$cfg"; then
+        local cfg_bak="${cfg}.linka-bak"
+        cp -a "$cfg" "$cfg_bak" 2>/dev/null || true
+
+        if sed -i "s|input_path = \"templates/|input_path = \"$tpl/|g" "$cfg"; then
+            log_ok 'Matugen: пути шаблонов сделаны абсолютными'
+        else
+            mv -f "$cfg_bak" "$cfg" 2>/dev/null || true
+            log_warn 'Не удалось поправить matugen config.toml'
+        fi
+    fi
+
+    return 0
+}
+
+matugen_needs_repair() {
+    local repo_qml="$1/src/quickshell/singletons/theme/Matugen.qml"
+    local target_qml="$TARGET_BASE/src/quickshell/singletons/theme/Matugen.qml"
+    local rc=0
+
+    if [[ "${SERPANTINUM_MATUGEN_COMPAT:-auto}" == "0" ]]; then
+        return 1
+    fi
+
+    if [[ -f "$repo_qml" && ! -f "$target_qml" ]]; then
+        return 0
+    fi
+
+    # Повреждение = флаг есть в репо, нет в установленном QML, хотя matugen его
+    # поддерживает (значит, его кто-то удалил зря — например, старая linka).
+    if [[ -f "$repo_qml" && -f "$target_qml" ]]; then
+        matugen_supports_source_color_index || rc=$?
+
+        if [[ "$rc" -eq 0 ]] &&
+           grep -q 'source-color-index' "$repo_qml" 2>/dev/null &&
+           ! grep -q 'source-color-index' "$target_qml" 2>/dev/null; then
+            return 0
+        fi
+    fi
+
+    return 1
+}
+
+# ---------- SDDM ----------
+other_display_manager_enabled() {
+    local link
+    link="$(readlink -f /etc/systemd/system/display-manager.service 2>/dev/null || true)"
+
+    if [[ -n "$link" && "$link" != *sddm* ]]; then
+        return 0
+    fi
+
+    return 1
+}
+
+ensure_sddm_package() {
+    if [[ "$DISTRO" == fedora ]]; then
+        if pkg_installed sddm; then
+            return 0
+        fi
+
+        run_root dnf install -y sddm qt6-qtdeclarative qt6-qtsvg || return 1
+    else
+        if pkg_installed x11-misc/sddm; then
+            return 0
+        fi
+
+        run_root emerge --ask=n x11-misc/sddm dev-qt/qtdeclarative dev-qt/qtsvg || return 1
+    fi
+
+    return 0
+}
+
+setup_sddm() {
+    local repo="$1"
+
+    if [[ "$OPT_SDDM" != true ]]; then
+        return 0
+    fi
+
+    if ! ensure_sddm_package; then
+        log_warn 'SDDM: пакет не установлен'
+        return 0
+    fi
+
+    local src="$repo/config/sddm/themes/material-you"
+    if [[ ! -d "$src" ]]; then
+        log_warn 'SDDM: тема не найдена в репо'
+        return 0
+    fi
+
+    if ! run_root mkdir -p /etc/sddm.conf.d "$SDDM_THEME_DIR"; then
+        log_warn 'SDDM: не удалось создать каталоги'
+        return 0
+    fi
+
+    if ! run_root cp -a "$src/." "$SDDM_THEME_DIR/"; then
+        log_warn 'SDDM: не удалось скопировать тему'
+        return 0
+    fi
+
+    run_root chmod -R a+rX "$SDDM_THEME_DIR" || true
+
+    if ! run_root tee "$SDDM_MANAGED_CONF" >/dev/null <<'EOF_SDDM'
+[Theme]
+Current=material-you
+ThemeDir=/usr/share/sddm/themes
+
+[General]
+InputMethod=
+EOF_SDDM
+    then
+        log_warn 'SDDM: не удалось записать конфиг'
+        return 0
+    fi
+
+    if [[ "$(detect_init_system)" == systemd ]]; then
+        if other_display_manager_enabled; then
+            log_warn 'SDDM: тема установлена, но в системе включён другой display manager — sddm.service не включаю (переключите вручную при желании)'
+            return 0
+        fi
+
+        if run_root systemctl enable sddm.service; then
+            update_state_field SDDM_ENABLED_BY_LINKA true
+        else
+            log_warn 'SDDM: не удалось включить sddm.service'
+            return 0
+        fi
+    fi
+
+    log_ok 'SDDM настроен.'
+    return 0
+}
+
+# ---------- config ----------
+detect_system_language() {
+    local repo="$1"
+    local locale="${LC_ALL:-${LC_MESSAGES:-${LANG:-}}}"
+    local lang="${locale%%[_.@]*}"
+    lang="${lang,,}"
+
+    # украинский в шелле называется ua.json
+    if [[ "$lang" == uk ]]; then lang=ua; fi
+
+    if [[ -n "$lang" && -f "$repo/src/assets/languages/${lang}.json" ]]; then
+        printf '%s' "$lang"
+    else
+        printf 'en'
+    fi
+    return 0
+}
+
+refresh_location() {
+    local script="$TARGET_BASE/src/scripts/location.sh"
+
+    if [[ ! -f "$script" ]]; then
+        return 0
+    fi
+
+    log_info 'Определяю локацию (погода)...'
+    if command -v timeout >/dev/null 2>&1; then
+        timeout 30 env -u SERPANTINUM_DIR -u QS_DIR -u MAIN_QML bash "$script" --refresh >/dev/null 2>&1 || true
+    else
+        env -u SERPANTINUM_DIR -u QS_DIR -u MAIN_QML bash "$script" --refresh >/dev/null 2>&1 || true
+    fi
+
+    return 0
+}
+
+# Единая логика: дефолты из репо + пользовательские значения поверх;
+# wallpaperDir выставляется только если он пустой/отсутствует.
+merge_serpantinum_config() {
+    local repo="$1"
+    local tj="$repo/config/serpantinum/settings.json"
+    local tmp wp lang
+
+    mkdir -p "$CONFIG_DIR" || return 0
+
+    if [[ ! -f "$tj" ]]; then
+        if [[ ! -f "$CONFIG_FILE" ]]; then
+            printf '{}\n' > "$CONFIG_FILE"
+        fi
+        return 0
+    fi
+
+    if ! command -v jq >/dev/null 2>&1; then
+        if [[ ! -f "$CONFIG_FILE" ]]; then
+            cp -a "$tj" "$CONFIG_FILE" 2>/dev/null || true
+        fi
+        return 0
+    fi
+
+    wp="$(get_wallpaper_dir)"
+    lang="$(detect_system_language "$repo")"
+
+    if [[ ! -f "$CONFIG_FILE" || ! -s "$CONFIG_FILE" ]]; then
+        tmp="$(mktemp "$CONFIG_DIR/.settings.XXXXXX")" || return 0
+
+        if jq --arg wp "$wp" --arg lang "$lang" '
+            . + (if ($wp|length)>0 then {wallpaperDir:$wp} else {} end)
+            | if ((.general.language // "") | length) == 0
+              then .general = ((.general // {}) + {language:$lang})
+              else .
+              end
+        ' "$tj" > "$tmp" 2>/dev/null; then
+            chmod 600 "$tmp" 2>/dev/null || true
+            mv -f "$tmp" "$CONFIG_FILE"
+        else
+            rm -f "$tmp"
+            cp -a "$tj" "$CONFIG_FILE" 2>/dev/null || true
+        fi
+
+        return 0
+    fi
+
+    tmp="$(mktemp "$CONFIG_DIR/.settings.XXXXXX")" || return 0
+
+    if jq -s --arg wp "$wp" --arg lang "$lang" '
+        (.[0] * .[1])
+        | if ((.wallpaperDir // "") | length) == 0 and ($wp|length)>0
+          then .wallpaperDir = $wp
+          else .
+          end
+        | if ((.general.language // "") | length) == 0
+          then .general = ((.general // {}) + {language:$lang})
+          else .
+          end
+    ' "$tj" "$CONFIG_FILE" > "$tmp" 2>/dev/null; then
+        chmod 600 "$tmp" 2>/dev/null || true
+        mv -f "$tmp" "$CONFIG_FILE"
+    else
+        rm -f "$tmp"
+        log_warn "Не удалось смержить settings.json; оставляю пользовательский конфиг"
+    fi
+
+    return 0
+}
+
+# Бэкапы (update.*, target.*, configs.*) копятся с каждым обновлением —
+# оставляем BACKUP_KEEP самых свежих каждого вида (LINKA_BACKUP_KEEP=0 —
+# не удалять ничего). Имена содержат метку времени, поэтому sort = хронология.
+rotate_backups() {
+    local keep="$BACKUP_KEEP" prefix i
+    local list=()
+
+    if [[ ! "$keep" =~ ^[0-9]+$ ]]; then
+        keep=5
+    fi
+
+    if [[ "$keep" -eq 0 || ! -d "$BACKUP_BASE" ]]; then
+        return 0
+    fi
+
+    for prefix in update target configs; do
+        list=()
+        mapfile -t list < <(find "$BACKUP_BASE" -mindepth 1 -maxdepth 1 -type d -name "${prefix}.[0-9]*" 2>/dev/null | sort)
+
+        if [[ ${#list[@]} -gt "$keep" ]]; then
+            for ((i = 0; i < ${#list[@]} - keep; i++)); do
+                rm -rf -- "${list[$i]}"
+            done
+            log_info "Старые бэкапы ${prefix}.*: оставлено $keep, удалено $((${#list[@]} - keep))"
+        fi
+    done
+
+    return 0
+}
+
+backup_update_state() {
+    UPDATE_BACKUP_DIR="$BACKUP_BASE/update.$(date +%Y%m%d_%H%M%S)"
+
+    mkdir -p "$UPDATE_BACKUP_DIR/config" "$UPDATE_BACKUP_DIR/sounds" || return 1
+
+    if [[ -d "$CONFIG_DIR" ]]; then
+        cp -a "$CONFIG_DIR/." "$UPDATE_BACKUP_DIR/config/" 2>/dev/null || true
+    fi
+
+    if [[ -d "$STATE_DIR/sounds" ]]; then
+        cp -a "$STATE_DIR/sounds/." "$UPDATE_BACKUP_DIR/sounds/" 2>/dev/null || true
+    fi
+
+    mkdir -p "$STATE_DIR" 2>/dev/null || true
+    printf '%s\n' "$UPDATE_BACKUP_DIR" > "$STATE_DIR/.last-update-backup" 2>/dev/null || true
+
+    return 0
+}
+
+restore_update_config() {
+    if [[ -z "$UPDATE_BACKUP_DIR" || ! -d "$UPDATE_BACKUP_DIR/config" ]]; then
+        return 0
+    fi
+
+    mkdir -p "$CONFIG_DIR"
+    cp -a "$UPDATE_BACKUP_DIR/config/." "$CONFIG_DIR/" 2>/dev/null || true
+    return 0
+}
+
+restore_update_sounds() {
+    if [[ -z "$UPDATE_BACKUP_DIR" || ! -d "$UPDATE_BACKUP_DIR/sounds" ]]; then
+        return 0
+    fi
+
+    mkdir -p "$STATE_DIR/sounds"
+    cp -a "$UPDATE_BACKUP_DIR/sounds/." "$STATE_DIR/sounds/" 2>/dev/null || true
+    return 0
+}
+
+sync_sounds_from_repo() {
+    local repo="$1"
+    local dst="$STATE_DIR/sounds"
+    local src="$repo/src/assets/sounds"
+
+    mkdir -p "$dst" || return 0
+
+    if [[ -d "$src" ]]; then
+        cp -a "$src/." "$dst/" 2>/dev/null || true
+    fi
+
+    if [[ -n "$UPDATE_BACKUP_DIR" && -d "$UPDATE_BACKUP_DIR/sounds" ]]; then
+        cp -a "$UPDATE_BACKUP_DIR/sounds/." "$dst/" 2>/dev/null || true
+    fi
+
+    return 0
+}
+
+write_version_file() {
+    # Формат совместим с официальным install/modules/version.sh.
+    # TELEMETRY_* сохраняем, только если они уже были; сами не создаём.
+    local vf="$STATE_DIR/version" tel_id="" tel_en="" tmp
+
+    mkdir -p "$STATE_DIR"
+
+    if [[ -f "$vf" ]]; then
+        tel_id="$(awk -F= '/^TELEMETRY_ID=/{gsub(/"/,"",$2); print $2; exit}' "$vf" 2>/dev/null || true)"
+        tel_en="$(awk -F= '/^ENABLE_TELEMETRY=/{gsub(/"/,"",$2); print $2; exit}' "$vf" 2>/dev/null || true)"
+    fi
+
+    tmp="$(mktemp "$STATE_DIR/.version.XXXXXX")" || return 0
+
+    {
+        printf 'SERPANTINUM_VERSION="%s"\n' "$TARGET_VERSION"
+        printf 'SERPANTINUM_COMMIT="%s"\n' "$TARGET_COMMIT"
+        if [[ -n "$tel_id" ]]; then printf 'TELEMETRY_ID="%s"\n' "$tel_id"; fi
+        if [[ -n "$tel_en" ]]; then printf 'ENABLE_TELEMETRY="%s"\n' "$tel_en"; fi
+        printf 'SELECTED_COMPOSITORS="%s"\n' "$(serialize_array)"
+    } > "$tmp"
+
+    chmod 600 "$tmp" 2>/dev/null || true
+    mv -f "$tmp" "$vf"
+    return 0
+}
+
+ensure_update_dependencies() {
+    bootstrap_installer_deps || true
+
+    local missing=()
+    local cmd
+
+    for cmd in matugen quickshell; do
+        if ! command -v "$cmd" >/dev/null 2>&1; then
+            missing+=("$cmd")
+        fi
+    done
+
+    if [[ ${#missing[@]} -gt 0 ]]; then
+        log_warn "Для обновления не хватает: ${missing[*]}"
+        log_info 'Пытаюсь доставить зависимости через install_dependencies'
+
+        local comps=()
+
+        if [[ ${#SELECTED_COMPOSITORS[@]} -gt 0 ]]; then
+            comps=("${SELECTED_COMPOSITORS[@]}")
+        elif [[ ${#SELECTED_COMPOSITORS_SAVED[@]} -gt 0 ]]; then
+            comps=("${SELECTED_COMPOSITORS_SAVED[@]}")
+        fi
+
+        if [[ ${#comps[@]} -gt 0 ]]; then
+            install_dependencies "${comps[@]}" || true
+        else
+            install_dependencies || true
+        fi
+    elif command -v quickshell >/dev/null 2>&1; then
+        check_quickshell
+    fi
+
+    return 0
+}
+
+# ---------- compositor detection ----------
+init_compositor_detection() {
+    local installed=()
+    local c
+    local running=''
+
+    for c in hyprland niri sway; do
+        if command -v "$c" >/dev/null 2>&1 || pkg_installed "$(comp_atom "$c")"; then
+            installed+=("$c")
+        fi
+    done
+
+    local de="${XDG_CURRENT_DESKTOP,,}"
+    local se="${DESKTOP_SESSION,,}"
+
+    if [[ -n "${HYPRLAND_INSTANCE_SIGNATURE:-}" ]] ||
+       pgrep -x Hyprland >/dev/null 2>&1 ||
+       pgrep -x hyprland >/dev/null 2>&1 ||
+       [[ "$de" == *hyprland* || "$se" == *hyprland* ]]; then
+        running=hyprland
+    elif [[ -n "${SWAYSOCK:-}" ]] ||
+         pgrep -x sway >/dev/null 2>&1 ||
+         [[ "$de" == *sway* || "$se" == *sway* ]]; then
+        running=sway
+    elif pgrep -x niri >/dev/null 2>&1 ||
+         [[ "$de" == *niri* || "$se" == *niri* ]]; then
+        running=niri
+    fi
+
+    SELECTED_COMPOSITORS=()
+
+    if [[ -n "$running" ]]; then
+        SELECTED_COMPOSITORS=("$running")
+    elif [[ ${#SELECTED_COMPOSITORS_SAVED[@]} -gt 0 ]]; then
+        SELECTED_COMPOSITORS=("${SELECTED_COMPOSITORS_SAVED[@]}")
+    elif [[ ${#installed[@]} -eq 1 ]]; then
+        SELECTED_COMPOSITORS=("${installed[0]}")
+    fi
+
+    return 0
+}
+
+# ---------- TUI ----------
+selected_compositors_string() {
+    if [[ ${#SELECTED_COMPOSITORS[@]} -gt 0 ]]; then
+        printf '%s' "${SELECTED_COMPOSITORS[*]}"
+    fi
+    return 0
+}
+
+read_key() {
+    local k='' r=''
+
+    IFS= read -rsn1 k 2>/dev/null || true
+
+    if [[ "$k" == $'\x1b' ]]; then
+        IFS= read -rsn2 -t 0.05 r 2>/dev/null || true
+
+        case "$r" in
+            '[A'|'OA') printf 'UP\n' ;;
+            '[B'|'OB') printf 'DOWN\n' ;;
+            *) printf 'ESC\n' ;;
+        esac
+
+        return 0
+    fi
+
+    if [[ -z "$k" || "$k" == $'\n' || "$k" == $'\r' ]]; then
+        printf 'ENTER\n'
+        return 0
+    fi
+
+    if [[ "$k" == ' ' ]]; then
+        printf 'SPACE\n'
+        return 0
+    fi
+
+    printf '%s\n' "$k"
+    return 0
+}
+
+toggle_compositor() {
+    local t="$1"
+    local c
+    local f=false
+    local u=()
+
+    if [[ ${#SELECTED_COMPOSITORS[@]} -gt 0 ]]; then
+        for c in "${SELECTED_COMPOSITORS[@]}"; do
+            if [[ "$c" == "$t" ]]; then
+                f=true
+            else
+                u+=("$c")
+            fi
+        done
+    fi
+
+    if [[ "$f" == false ]]; then
+        u+=("$t")
+    fi
+
+    if [[ ${#u[@]} -eq 0 ]]; then
+        SELECTED_COMPOSITORS=()
+    else
+        SELECTED_COMPOSITORS=("${u[@]}")
+    fi
+
+    return 0
+}
+
+draw_menu() {
+    local title="$1"
+    shift
+
+    local cursor="$1"
+    shift
+
+    local items=("$@")
+    local i
+
+    clear 2>/dev/null || true
+
+    printf '%s%s%s | linka %s%s\n\n' "$BOLD" "$C_CYAN" "$title" "$LINKA_VERSION" "$RESET"
+
+    for i in "${!items[@]}"; do
+        if [[ "$i" -eq "$cursor" ]]; then
+            printf '%s%s ▸ %s%s\n' "$BOLD" "$C_CYAN" "$RESET" "${items[$i]}"
+        else
+            printf '    %s\n' "${items[$i]}"
+        fi
+    done
+
+    return 0
+}
+
+manage_compositors_menu() {
+    if [[ ! -t 0 ]]; then
+        return 0
+    fi
+
+    local cursor=0
+    local k
+    local m1 m2 m3
+    local sel
+
+    while true; do
+        m1='[ ]'
+        m2='[ ]'
+        m3='[ ]'
+
+        sel="$(selected_compositors_string)"
+
+        if [[ " ${sel:-} " == *" hyprland "* ]]; then m1='[✓]'; fi
+        if [[ " ${sel:-} " == *" niri "* ]]; then m2='[✓]'; fi
+        if [[ " ${sel:-} " == *" sway "* ]]; then m3='[✓]'; fi
+
+        draw_menu 'Compositors' "$cursor" "$m1 Hyprland" "$m2 Niri" "$m3 Sway" 'Done'
+        k="$(read_key)"
+
+        case "$k" in
+            UP)
+                if [[ "$cursor" -gt 0 ]]; then
+                    cursor=$((cursor-1))
+                else
+                    cursor=3
+                fi
+                ;;
+            DOWN)
+                if [[ "$cursor" -lt 3 ]]; then
+                    cursor=$((cursor+1))
+                else
+                    cursor=0
+                fi
+                ;;
+            ENTER|SPACE)
+                case "$cursor" in
+                    0) toggle_compositor hyprland ;;
+                    1) toggle_compositor niri ;;
+                    2) toggle_compositor sway ;;
+                    3) return 0 ;;
+                esac
+                ;;
+            ESC|q)
+                return 0
+                ;;
+        esac
+    done
+}
+
+run_installer_ui() {
+    if [[ ! -t 0 ]]; then
+        if [[ ${#SELECTED_COMPOSITORS[@]} -eq 0 ]]; then
+            log_error 'Нет TTY и не выбран compositor.'
+            return 1
+        fi
+        return 0
+    fi
+
+    local cursor=0
+    local k
+    local comps
+    local sel
+
+    if [[ ${#SELECTED_COMPOSITORS[@]} -gt 0 ]]; then
+        cursor=3
+    fi
+
+    while true; do
+        sel="$(selected_compositors_string)"
+        comps="${sel:-NOT SELECTED}"
+
+        draw_menu "mode: $MODE | target: $TARGET_VERSION" "$cursor" \
+            "Compositors: $comps" \
+            "SDDM: $([[ "$OPT_SDDM" == true ]] && echo ON || echo OFF)" \
+            "Wallpapers: $([[ "$INSTALL_FULL_WALLPAPERS" == true ]] && echo full || echo 3-random)" \
+            'НАЧАТЬ' 'Exit'
+
+        k="$(read_key)"
+
+        case "$k" in
+            UP)
+                if [[ "$cursor" -gt 0 ]]; then
+                    cursor=$((cursor-1))
+                else
+                    cursor=4
+                fi
+                ;;
+            DOWN)
+                if [[ "$cursor" -lt 4 ]]; then
+                    cursor=$((cursor+1))
+                else
+                    cursor=0
+                fi
+                ;;
+            ENTER|SPACE)
+                case "$cursor" in
+                    0) manage_compositors_menu ;;
+                    1)
+                        if [[ "$OPT_SDDM" == true ]]; then
+                            OPT_SDDM=false
+                        else
+                            OPT_SDDM=true
+                        fi
+                        ;;
+                    2)
+                        if [[ "$INSTALL_FULL_WALLPAPERS" == true ]]; then
+                            INSTALL_FULL_WALLPAPERS=false
+                        else
+                            INSTALL_FULL_WALLPAPERS=true
+                        fi
+                        ;;
+                    3)
+                        if [[ ${#SELECTED_COMPOSITORS[@]} -eq 0 ]]; then
+                            log_error 'Выберите compositor'
+                            sleep 1
+                            continue
+                        fi
+                        return 0
+                        ;;
+                    4)
+                        return 1
+                        ;;
+                esac
+                ;;
+            ESC|q)
+                return 1
+                ;;
+        esac
+    done
+}
+
+# ---------- workflows ----------
+flow_install() {
+    local requested="$1"
+    local sel
+
+    INSTALL_STATE="$(detect_install_state)"
+
+    # load_state ДО вычисления версий: он перезаписывает OLD_VERSION/OLD_COMMIT.
+    load_state
+    OLD_VERSION="$(get_installed_version)"
+    TARGET_VERSION="$(get_target_version "$PROJECT_ROOT")"
+    TARGET_COMMIT="$(get_target_commit "$PROJECT_ROOT")"
+
+    MODE="$requested"
+    IS_REINSTALL=false
+
+    if [[ "$requested" == reinstall ]]; then
+        IS_REINSTALL=true
+    fi
+
+    init_compositor_detection
+
+    if ! run_installer_ui; then
+        log_info 'Установка отменена.'
+        return 0
+    fi
+
+    sel="$(selected_compositors_string)"
+    log_info "Установка: distro=$DISTRO | compositor=${sel:-none} | SDDM=$OPT_SDDM | target=$TARGET_VERSION ($TARGET_COMMIT)"
+
+    if [[ "$INSTALL_STATE" == current && "$IS_REINSTALL" != true ]]; then
+        log_info 'Serpantinum уже установлен: файлы обновляются поверх, пользовательские конфиги не перезаписываются (для чистой установки — linka reinstall).'
+    fi
+
+    if [[ ${#SELECTED_COMPOSITORS[@]} -gt 0 ]]; then
+        install_dependencies "${SELECTED_COMPOSITORS[@]}"
+    else
+        install_dependencies
+    fi
+
+    install_fonts || true
+
+    if [[ "$INSTALL_STATE" == current && "$IS_REINSTALL" != true ]]; then
+        backup_update_state || true
+    fi
+
+    stop_shell || log_warn 'shell не остановлен штатно'
+
+    OLD_COMMIT="$(get_installed_commit)"
+
+    if [[ ${#SELECTED_COMPOSITORS[@]} -gt 0 ]]; then
+        if ! deploy_package "$PROJECT_ROOT" "$OLD_COMMIT" "$TARGET_COMMIT" "$IS_REINSTALL" "$INSTALL_STATE" "${SELECTED_COMPOSITORS[@]}"; then
+            log_error 'Deploy не удался.'
+            return 1
+        fi
+    else
+        if ! deploy_package "$PROJECT_ROOT" "$OLD_COMMIT" "$TARGET_COMMIT" "$IS_REINSTALL" "$INSTALL_STATE"; then
+            log_error 'Deploy не удался.'
+            return 1
+        fi
+    fi
+
+    sync_sounds_from_repo "$PROJECT_ROOT" || true
+    fix_matugen_compat || true
+    setup_sddm "$PROJECT_ROOT" || true
+    install_wallpapers "$INSTALL_FULL_WALLPAPERS" || true
+    merge_serpantinum_config "$PROJECT_ROOT" || true
+    setup_services || true
+
+    if [[ "$INSTALL_STATE" != current || "$IS_REINSTALL" == true ]]; then
+        refresh_location || true
+    fi
+
+    rm -f "$STATE_DIR/first_launch.done" "$HOME/.local/state/quickshell/first_launch.done" 2>/dev/null || true
+
+    mark_shell_state || true
+    write_version_file || true
+
+
+
+    # Вызов пользовательского post-update хука (восстановление кастомных виджетов)
+    local user_hook="$CONFIG_DIR/hooks/post_update.sh"
+    if [[ -x "$user_hook" ]]; then
+        log_info "Выполняю пользовательский хук: $user_hook"
+        "$user_hook" || log_warn "Пользовательский хук завершился с ошибкой"
+    fi
+    if start_shell; then
+        log_ok "Serpantinum $TARGET_VERSION ($TARGET_COMMIT) запущен."
+    else
+        log_warn "Установка завершена, но shell не стартовал. Запусти вручную: serpantinumd start"
+    fi
+
+    if [[ ${#FAILED_PKGS[@]} -gt 0 ]]; then
+        log_warn "Проблемы с пакетами: ${FAILED_PKGS[*]}"
+    fi
+
+    rotate_backups || true
+    return 0
+}
+
+# Полный rollback bin/ и src/ не делается осознанно: снапшот всего TARGET_BASE
+# слишком дорог по диску. Состояние не помечается как обновлённое, поэтому
+# следующий update снова пройдёт от старого коммита и докопирует файлы.
+warn_partial_update() {
+    log_warn 'bin/ и src/ могли обновиться частично (полный откат не делается — снапшот TARGET_BASE слишком дорог по диску).'
+    log_warn "Конфиг и звуки восстанавливаются из бэкапа: ${UPDATE_BACKUP_DIR:-нет бэкапа}"
+    log_warn 'Повторите `linka update` (или `linka update --force`) — недостающие файлы будут докопированы.'
+    return 0
+}
+
+flow_update() {
+    if ! is_installed; then
+        log_info 'Не установлен — переключаюсь на установку.'
+        flow_install install
+        return $?
+    fi
+
+    load_state
+    init_compositor_detection
+
+    OLD_COMMIT="$(get_installed_commit)"
+    OLD_VERSION="$(get_installed_version)"
+    TARGET_COMMIT="$(get_target_commit "$PROJECT_ROOT")"
+    TARGET_VERSION="$(get_target_version "$PROJECT_ROOT")"
+
+    if [[ "$OLD_COMMIT" == "$TARGET_COMMIT" && "$OLD_COMMIT" != unknown && "$FORCE_UPDATE" != 1 ]]; then
+        if matugen_needs_repair "$PROJECT_ROOT"; then
+            log_info 'Коммит не изменился, но Matugen повреждён — восстанавливаю файлы.'
+            FORCE_UPDATE=1
+        else
+            log_ok "Уже на $TARGET_VERSION ($TARGET_COMMIT)."
+            log_info 'Если цвета обоев пропали, запусти принудительно: linka update --force'
+            return 0
+        fi
+    fi
+
+    if [[ "$FORCE_UPDATE" == 1 ]]; then
+        log_info 'Принудительное обновление включено.'
+    fi
+
+    local sel
+    sel="$(selected_compositors_string)"
+
+    log_info "Обновление: $OLD_VERSION ($OLD_COMMIT) -> $TARGET_VERSION ($TARGET_COMMIT)"
+    log_info "Ветка: ${ACTIVE_REPO_BRANCH:-$REPO_BRANCH}"
+    log_info "Compositors: ${sel:-none}"
+
+    # В фоне пакеты не доставляем (нужен root, может идти часами) — только файлы шелла.
+    if [[ "$AUTO_MODE" != 1 ]]; then
+        ensure_update_dependencies || true
+    fi
+    backup_update_state || true
+
+    local shell_was_running=1
+    if ! shell_running; then
+        shell_was_running=0
+    fi
+
+    if ! stop_shell; then
+        log_warn 'shell не остановлен штатно'
+    fi
+
+    if [[ ${#SELECTED_COMPOSITORS[@]} -gt 0 ]]; then
+        if ! deploy_package "$PROJECT_ROOT" "$OLD_COMMIT" "$TARGET_COMMIT" false current "${SELECTED_COMPOSITORS[@]}"; then
+            log_error 'Deploy не удался.'
+            warn_partial_update
+            restore_update_config || true
+            restore_update_sounds || true
+            start_shell_unless_idle "$shell_was_running" || true
+            return 1
+        fi
+    else
+        if ! deploy_package "$PROJECT_ROOT" "$OLD_COMMIT" "$TARGET_COMMIT" false current; then
+            log_error 'Deploy не удался.'
+            warn_partial_update
+            restore_update_config || true
+            restore_update_sounds || true
+            start_shell_unless_idle "$shell_was_running" || true
+            return 1
+        fi
+    fi
+
+    sync_sounds_from_repo "$PROJECT_ROOT" || true
+    merge_serpantinum_config "$PROJECT_ROOT" || true
+    fix_matugen_compat || true
+
+    mark_shell_state || true
+    write_version_file || true
+    if [[ "$AUTO_MODE" != 1 ]]; then
+        setup_services || true
+    fi
+
+    if start_shell_unless_idle "$shell_was_running"; then
+        log_ok "Обновлён: $TARGET_VERSION ($TARGET_COMMIT)."
+    else
+        log_warn 'Обновлён, но shell не стартовал. Попробуйте вручную:'
+        log_warn "  $BIN_DIR/serpantinumd start"
+    fi
+
+    rotate_backups || true
+    return 0
+}
+
+emergency_remove() {
+    local c sddm_ours='' rb
+
+    clear 2>/dev/null || true
+    printf '%sУДАЛЕНИЕ SERPANTINUM%s\n' "$BOLD" "$RESET"
+
+    read -r -p 'Продолжить? [y/N] ' c || true
+    if [[ ! "$c" =~ ^[Yy]$ ]]; then
+        log_info 'Отменено.'
+        return 0
+    fi
+
+    acquire_lock
+    start_sudo_keepalive
+
+    # Читаем ДО удаления state-файла.
+    sddm_ours="$(state_get SDDM_ENABLED_BY_LINKA || true)"
+
+    # Настройки пользователя — единственное, что нельзя восстановить
+    # переустановкой, поэтому перед удалением кладём копию в бэкапы.
+    if [[ -d "$CONFIG_DIR" && -n "$(ls -A "$CONFIG_DIR" 2>/dev/null || true)" ]]; then
+        rb="$BACKUP_BASE/removed.$(date +%Y%m%d_%H%M%S)"
+        if mkdir -p "$rb" && cp -a "$CONFIG_DIR/." "$rb/" 2>/dev/null; then
+            log_info "Настройки сохранены: $rb"
+        else
+            log_warn "Не удалось сохранить настройки в $rb"
+        fi
+    fi
+
+    kill_serpantinum || true
+
+    # Иначе фоновый таймер продолжил бы работать после удаления.
+    auto_disable --quiet || true
+
+    if [[ -d "$TARGET_BASE" ]]; then
+        rm -rf "$TARGET_BASE"
+    fi
+
+    rm -rf "$CONFIG_DIR"
+    rm -f "$BIN_DIR/serpantinum" "$BIN_DIR/serpantinumd"
+    run_optional_root rm -f /usr/local/bin/serpantinum /usr/local/bin/serpantinumd || true
+
+    if [[ -f "$SDDM_MANAGED_CONF" ]]; then
+        run_optional_root rm -f "$SDDM_MANAGED_CONF" || true
+    fi
+
+    if [[ -d "$SDDM_THEME_DIR" ]]; then
+        run_optional_root rm -rf "$SDDM_THEME_DIR" || true
+    fi
+
+    if [[ -d "$FONT_SYSTEM_DIR" ]]; then
+        run_optional_root rm -rf "$FONT_SYSTEM_DIR" || true
+    fi
+
+    if [[ -d "$USER_FONT_DIR" ]]; then
+        rm -rf "$USER_FONT_DIR"
+    fi
+
+    # sddm отключаем только если его включила сама linka: иначе можно
+    # оставить человека без экрана входа.
+    if [[ "$sddm_ours" == true ]] && command -v systemctl >/dev/null 2>&1; then
+        run_optional_root systemctl disable sddm.service || true
+        log_warn 'sddm.service отключён — при следующей загрузке нужен другой способ входа (или включите свой DM).'
+    fi
+
+    rm -f "$STATE_FILE" "$STATE_DIR/version" "$STATE_DIR/.last-update-backup" 2>/dev/null || true
+    rm -rf "$STATE_DIR/sounds" 2>/dev/null || true
+
+    log_ok 'Serpantinum удалён.'
+    return 0
+}
+
+# ---------- автообновление в фоне ----------
+# `linka auto run` — один проход: его вызывает таймер systemd (--user) или цикл
+# `linka auto daemon` там, где user-таймеров нет (OpenRC и т.п.). В этом режиме
+# (AUTO_MODE=1) нет TTY и нельзя спрашивать пароль: sudo всегда с -n, пакеты
+# шелла не доустанавливаются, а root-шаги идут только через узкое правило
+# sudoers (см. auto_install_sudoers) на несколько точных команд.
+
+auto_get() {
+    local v=""
+    if [[ -f "$AUTO_CONF" ]]; then
+        v="$(awk -F= -v k="$1" '$1==k{sub(/^[^=]*=/,""); print; exit}' "$AUTO_CONF" 2>/dev/null || true)"
+    fi
+    printf '%s\n' "${v:-${2:-}}"
+    return 0
+}
+
+auto_set() {
+    local key="$1" val tmp
+    val="$(printf '%s' "$2" | tr '\n\r' '  ')"
+    mkdir -p "$STATE_DIR"
+    tmp="$(mktemp "$STATE_DIR/.auto.XXXXXX")"
+
+    if [[ -f "$AUTO_CONF" ]]; then
+        awk -F= -v k="$key" -v v="$val" '
+            BEGIN{f=0}
+            $1==k{print k"="v; f=1; next}
+            {print}
+            END{if(!f) print k"="v}
+        ' "$AUTO_CONF" > "$tmp"
+    else
+        printf '%s=%s\n' "$key" "$val" > "$tmp"
+    fi
+
+    chmod 600 "$tmp"
+    mv -f "$tmp" "$AUTO_CONF"
+    return 0
+}
+
+auto_valid_mode() {
+    case "$1" in
+        off|notify|apply) return 0 ;;
+    esac
+    return 1
+}
+
+auto_valid_uint() {
+    [[ "$1" =~ ^[0-9]+$ ]] && [[ "$((10#$1))" -gt 0 ]]
+}
+
+auto_notify() {
+    if [[ "$(auto_get AUTO_NOTIFY 1)" != 1 ]]; then
+        return 0
+    fi
+    if ! command -v notify-send >/dev/null 2>&1; then
+        return 0
+    fi
+    notify-send -a linka -u "${3:-normal}" "$1" "$2" >/dev/null 2>&1 || true
+    return 0
+}
+
+auto_setup_log() {
+    local sz
+    mkdir -p "$STATE_DIR"
+
+    if [[ -f "$AUTO_LOG" ]]; then
+        sz="$(stat -c %s "$AUTO_LOG" 2>/dev/null || echo 0)"
+        if [[ "$sz" -gt "$AUTO_LOG_MAX" ]]; then
+            mv -f "$AUTO_LOG" "$AUTO_LOG.1" 2>/dev/null || true
+        fi
+    fi
+
+    exec >>"$AUTO_LOG" 2>&1
+    return 0
+}
+
+# Тихий вариант acquire_lock: в фоне занятый lock — не ошибка, а «в другой раз».
+acquire_lock_quiet() {
+    if ! command -v flock >/dev/null 2>&1; then
+        return 0
+    fi
+
+    exec 9>"$LOCK_FILE" || return 0
+
+    if ! flock -n 9; then
+        exec 9>&- 2>/dev/null || true
+        return 1
+    fi
+
+    return 0
+}
+
+auto_network_ok() {
+    curl -fsSI --connect-timeout 5 --max-time 15 https://github.com >/dev/null 2>&1
+}
+
+# Фоновый процесс не видит окружения графической сессии (WAYLAND_DISPLAY,
+# DBUS_SESSION_BUS_ADDRESS, сокет композитора...), а без него shell не стартует.
+# Берём его у уже работающего шелла — он как раз запущен внутри сессии.
+auto_adopt_session_env() {
+    local pid="" line
+
+    pid="$(pgrep -f "$TARGET_BASE/src/quickshell" 2>/dev/null | head -n1 || true)"
+    if [[ -z "$pid" ]]; then
+        pid="$(pgrep -x serpantinumd 2>/dev/null | head -n1 || true)"
+    fi
+
+    if [[ -z "$pid" || ! -r "/proc/$pid/environ" ]]; then
+        return 1
+    fi
+
+    while IFS= read -r -d '' line; do
+        case "$line" in
+            WAYLAND_DISPLAY=*|DISPLAY=*|XDG_RUNTIME_DIR=*|XDG_CURRENT_DESKTOP=*|\
+            XDG_SESSION_TYPE=*|DESKTOP_SESSION=*|DBUS_SESSION_BUS_ADDRESS=*|\
+            HYPRLAND_INSTANCE_SIGNATURE=*|SWAYSOCK=*|NIRI_SOCKET=*|QT_QPA_PLATFORM=*)
+                export "$line"
+                ;;
+        esac
+    done < "/proc/$pid/environ" || true
+
+    return 0
+}
+
+# Шелл перезапускаем, только если он работал до обновления: иначе фоновый
+# процесс запустил бы его в сессии, где его никто не просил.
+start_shell_unless_idle() {
+    if [[ "$AUTO_MODE" == 1 && "${1:-1}" == 0 ]]; then
+        log_info 'Шелл не был запущен — не стартую.'
+        return 0
+    fi
+    start_shell
+}
+
+auto_shell_step() {
+    local mode="$1" failed notified
+
+    if ! is_installed; then
+        log_info 'Serpantinum не установлен — пропускаю (в фоне ничего не ставлю).'
+        return 0
+    fi
+
+    REPO_BRANCH="$(auto_get AUTO_BRANCH "$REPO_BRANCH")"
+
+    if ! ensure_repo; then
+        log_warn 'Serpantinum: репозиторий недоступен — пропускаю.'
+        return 0
+    fi
+
+    load_state
+    init_compositor_detection
+
+    OLD_COMMIT="$(get_installed_commit)"
+    OLD_VERSION="$(get_installed_version)"
+    TARGET_COMMIT="$(get_target_commit "$PROJECT_ROOT")"
+    TARGET_VERSION="$(get_target_version "$PROJECT_ROOT")"
+
+    if [[ "$TARGET_COMMIT" == unknown || "$OLD_COMMIT" == "$TARGET_COMMIT" ]]; then
+        log_info "Serpantinum актуален ($OLD_VERSION, $OLD_COMMIT)."
+        return 0
+    fi
+
+    log_info "Serpantinum: доступно $OLD_VERSION ($OLD_COMMIT) -> $TARGET_VERSION ($TARGET_COMMIT)"
+
+    if [[ "$mode" == notify ]]; then
+        notified="$(auto_get AUTO_NOTIFIED_COMMIT '')"
+        if [[ "$notified" != "$TARGET_COMMIT" ]]; then
+            auto_notify 'Serpantinum: есть обновление' "$OLD_VERSION → $TARGET_VERSION. Применить: linka update"
+            auto_set AUTO_NOTIFIED_COMMIT "$TARGET_COMMIT"
+        fi
+        return 0
+    fi
+
+    # Не повторяем попытку на том же коммите: иначе при поломке шелл
+    # перезапускался бы каждые N часов.
+    failed="$(auto_get AUTO_FAILED_COMMIT '')"
+    if [[ "$failed" == "$TARGET_COMMIT" ]]; then
+        log_info "Прошлая попытка обновиться на $TARGET_COMMIT не удалась — не повторяю (linka update вручную)."
+        return 0
+    fi
+
+    auto_adopt_session_env || log_info 'Окружение сессии не найдено (шелл не запущен) — обновлю только файлы.'
+    auto_notify 'Serpantinum' "Обновляю: $OLD_VERSION → $TARGET_VERSION"
+
+    if flow_update; then
+        auto_set AUTO_FAILED_COMMIT ''
+        auto_notify 'Serpantinum обновлён' "$TARGET_VERSION ($TARGET_COMMIT)"
+    else
+        auto_set AUTO_FAILED_COMMIT "$TARGET_COMMIT"
+        auto_notify 'Serpantinum: обновление не удалось' "Подробности: $AUTO_LOG" critical
+    fi
+
+    return 0
+}
+
+# Тяжёлые операции не запускаем от батареи. Нет батареи (десктоп) — считаем,
+# что питание от сети.
+auto_on_battery() {
+    local d t online have_ac=0 have_bat=0
+
+    for d in /sys/class/power_supply/*; do
+        if [[ ! -r "$d/type" ]]; then
+            continue
+        fi
+        t="$(cat "$d/type" 2>/dev/null || true)"
+        case "$t" in
+            Battery)
+                have_bat=1
+                ;;
+            Mains)
+                online="$(cat "$d/online" 2>/dev/null || echo 0)"
+                if [[ "$online" == 1 ]]; then
+                    have_ac=1
+                fi
+                ;;
+        esac
+    done
+
+    [[ "$have_bat" == 1 && "$have_ac" == 0 ]]
+}
+
+auto_system_due() {
+    local every last now
+    every="$(auto_get AUTO_SYSTEM_EVERY_DAYS 1)"
+    last="$(auto_get AUTO_LAST_SYSTEM 0)"
+    now="$(date +%s)"
+
+    [[ "$last" =~ ^[0-9]+$ ]] || last=0
+    [[ "$every" =~ ^[0-9]+$ ]] || every=1
+
+    (( now - 10#$last >= 10#$every * 86400 ))
+}
+
+# Экранирование аргумента для sudoers: , : = \ нужно экранировать.
+sudoers_escape() {
+    printf '%s' "$1" | sed -e 's/[,:=\\]/\\&/g'
+}
+
+# Печатает по одной команде на строку (путь + аргументы) — ровно то, что
+# фоновый запуск вызывает через sudo -n и что пишется в sudoers.
+auto_privileged_commands() {
+    local mode="$1" bin
+
+    if [[ "$mode" == off ]]; then
+        return 0
+    fi
+
+    if [[ "$DISTRO" == fedora ]]; then
+        if [[ "$mode" == apply ]]; then
+            bin="$(command -v dnf 2>/dev/null || true)"
+            if [[ -n "$bin" ]]; then
+                printf '%s %s\n' "$bin" "${AUTO_DNF_APPLY[*]}"
+            fi
+        fi
+    else
+        bin="$(command -v emerge 2>/dev/null || true)"
+        if [[ -n "$bin" ]]; then
+            printf '%s %s\n' "$bin" "${AUTO_EMERGE_SYNC[*]}"
+            printf '%s %s\n' "$bin" "${AUTO_EMERGE_PRETEND[*]}"
+            if [[ "$mode" == apply ]]; then
+                printf '%s %s\n' "$bin" "${AUTO_EMERGE_APPLY[*]}"
+            fi
+        fi
+    fi
+
+    return 0
+}
+
+# Разрешён ли каждый нужный sudo-вызов БЕЗ пароля (-k игнорирует кэш тикета).
+auto_sudo_ok() {
+    local mode="$1" line
+    local -a words
+
+    while IFS= read -r line; do
+        if [[ -z "$line" ]]; then
+            continue
+        fi
+        read -r -a words <<< "$line"
+        if ! sudo -n -k -l "${words[@]}" >/dev/null 2>&1; then
+            return 1
+        fi
+    done < <(auto_privileged_commands "$mode")
+
+    return 0
+}
+
+auto_install_sudoers() {
+    local mode="$1" user line tmp w
+    local -a words esc
+    local -a rules=()
+
+    user="$(id -un)"
+
+    while IFS= read -r line; do
+        if [[ -z "$line" ]]; then
+            continue
+        fi
+        read -r -a words <<< "$line"
+        esc=()
+        for w in "${words[@]}"; do
+            esc+=("$(sudoers_escape "$w")")
+        done
+        rules+=("${esc[*]}")
+    done < <(auto_privileged_commands "$mode")
+
+    if [[ ${#rules[@]} -eq 0 ]]; then
+        log_error 'Не удалось определить команды для sudoers (нет dnf/emerge?).'
+        return 1
+    fi
+
+    local joined="" r
+    for r in "${rules[@]}"; do
+        joined+="${joined:+, }$r"
+    done
+
+    tmp="$(mktemp)"
+    {
+        printf '# Создано linka (linka auto enable). Удаляется командой: linka auto disable\n'
+        printf '# Разрешает пользователю %s выполнять БЕЗ пароля только эти точные команды.\n' "$user"
+        printf '%s ALL=(root) NOPASSWD: %s\n' "$user" "$joined"
+    } > "$tmp"
+
+    if command -v visudo >/dev/null 2>&1 && ! visudo -cf "$tmp" >/dev/null 2>&1; then
+        log_error 'Сгенерированный sudoers не прошёл проверку visudo — не устанавливаю.'
+        rm -f "$tmp"
+        return 1
+    fi
+
+    if ! run_root install -m 0440 -o root -g root "$tmp" "$AUTO_SUDOERS_FILE"; then
+        log_error "Не удалось установить $AUTO_SUDOERS_FILE"
+        rm -f "$tmp"
+        return 1
+    fi
+
+    rm -f "$tmp"
+
+    if auto_sudo_ok "$mode"; then
+        log_ok "Правило sudoers установлено: $AUTO_SUDOERS_FILE"
+    else
+        log_warn "Правило записано, но sudo всё ещё просит пароль. Проверьте, что /etc/sudoers подключает /etc/sudoers.d."
+        return 1
+    fi
+
+    return 0
+}
+
+# `dnf needs-restarting -r` сам возвращает 1, когда перезагрузка нужна, поэтому
+# смотрим на текст, а не на код возврата (и не через pipe — мешает pipefail).
+auto_reboot_hint() {
+    local out
+    out="$(dnf needs-restarting -r 2>&1 || true)"
+    grep -qi 'reboot is required' <<< "$out"
+}
+
+auto_system_fedora() {
+    local mode="$1" rc=0 bin
+
+    bin="$(command -v dnf 2>/dev/null || true)"
+    if [[ -z "$bin" ]]; then
+        log_warn 'Система: dnf не найден.'
+        return 0
+    fi
+
+    "$bin" -q --refresh check-upgrade >/dev/null 2>&1 || rc=$?
+
+    case "$rc" in
+        0)
+            log_info 'Система: обновлений нет.'
+            auto_set AUTO_LAST_SYSTEM "$(date +%s)"
+            return 0
+            ;;
+        100)
+            ;;
+        *)
+            log_warn "Система: dnf check-upgrade завершился с кодом $rc."
+            return 0
+            ;;
+    esac
+
+    if [[ "$mode" == notify ]]; then
+        log_info 'Система: есть обновления пакетов (режим notify).'
+        auto_notify 'Обновления системы' 'Есть обновления пакетов. Применить: sudo dnf upgrade'
+        auto_set AUTO_LAST_SYSTEM "$(date +%s)"
+        return 0
+    fi
+
+    if ! auto_sudo_ok apply; then
+        log_warn 'Система: sudo просит пароль. Выполните: linka auto enable --system apply'
+        auto_notify 'Обновление системы не выполнено' 'sudo просит пароль: linka auto enable --system apply' critical
+        return 0
+    fi
+
+    log_info 'Система: dnf upgrade...'
+    if run_root "$bin" "${AUTO_DNF_APPLY[@]}"; then
+        auto_set AUTO_LAST_SYSTEM "$(date +%s)"
+        if auto_reboot_hint; then
+            log_ok 'Система обновлена, нужна перезагрузка.'
+            auto_notify 'Система обновлена' 'Нужна перезагрузка, чтобы применить обновления ядра/библиотек.'
+        else
+            log_ok 'Система обновлена.'
+            auto_notify 'Система обновлена' 'Пакеты обновлены.'
+        fi
+    else
+        log_warn 'Система: dnf upgrade завершился с ошибкой.'
+        auto_notify 'Обновление системы не удалось' "Подробности: $AUTO_LOG" critical
+    fi
+
+    return 0
+}
+
+auto_system_gentoo() {
+    local mode="$1" bin out="" n=0
+
+    bin="$(command -v emerge 2>/dev/null || true)"
+    if [[ -z "$bin" ]]; then
+        log_warn 'Система: emerge не найден.'
+        return 0
+    fi
+
+    if ! auto_sudo_ok "$mode"; then
+        log_warn "Система: sudo просит пароль. Выполните: linka auto enable --system $mode"
+        auto_notify 'Обновление системы не выполнено' "sudo просит пароль: linka auto enable --system $mode" critical
+        return 0
+    fi
+
+    log_info 'Система: emerge --sync...'
+    if ! run_root "$bin" "${AUTO_EMERGE_SYNC[@]}" >/dev/null 2>&1; then
+        log_warn 'Система: emerge --sync не удался.'
+        return 0
+    fi
+
+    out="$(run_root "$bin" "${AUTO_EMERGE_PRETEND[@]}" 2>&1 || true)"
+    n="$(printf '%s\n' "$out" | grep -c '^\[ebuild' || true)"
+
+    if [[ "$n" -eq 0 ]]; then
+        log_info 'Система: обновлений нет.'
+        auto_set AUTO_LAST_SYSTEM "$(date +%s)"
+        return 0
+    fi
+
+    log_info "Система: пакетов к обновлению — $n."
+
+    if printf '%s\n' "$out" | grep -q '^\[blocks'; then
+        log_warn 'Система: emerge сообщает о блокировках — автоматически не обновляю.'
+        auto_notify 'Обновления системы' "Пакетов к обновлению: $n, но есть блокировки — нужен ручной emerge." critical
+        auto_set AUTO_LAST_SYSTEM "$(date +%s)"
+        return 0
+    fi
+
+    if [[ "$mode" == notify ]]; then
+        auto_notify 'Обновления системы' "Пакетов к обновлению: $n. Применить: emerge -uDN @world"
+        auto_set AUTO_LAST_SYSTEM "$(date +%s)"
+        return 0
+    fi
+
+    log_info 'Система: emerge @world (может занять часы)...'
+    if run_root "$bin" "${AUTO_EMERGE_APPLY[@]}"; then
+        auto_set AUTO_LAST_SYSTEM "$(date +%s)"
+        log_ok 'Система обновлена.'
+        auto_notify 'Система обновлена' "Обновлено пакетов: $n. Проверьте etc-update/dispatch-conf."
+    else
+        log_warn 'Система: emerge завершился с ошибкой.'
+        auto_notify 'Обновление системы не удалось' "Подробности: $AUTO_LOG" critical
+    fi
+
+    return 0
+}
+
+auto_system_step() {
+    local mode
+    mode="$(auto_get AUTO_SYSTEM off)"
+
+    if [[ "$mode" == off ]]; then
+        return 0
+    fi
+
+    if ! auto_system_due; then
+        log_info 'Система: ещё рано (AUTO_SYSTEM_EVERY_DAYS).'
+        return 0
+    fi
+
+    if auto_on_battery; then
+        log_info 'Система: работаю от батареи — пропускаю.'
+        return 0
+    fi
+
+    if [[ "$DISTRO" == fedora ]]; then
+        auto_system_fedora "$mode"
+    else
+        auto_system_gentoo "$mode"
+    fi
+
+    return 0
+}
+
+auto_run_body() {
+    local t
+
+    printf '=== %s | linka %s | auto run ===\n' "$(date '+%F %T')" "$LINKA_VERSION"
+
+    for t in git curl; do
+        if ! command -v "$t" >/dev/null 2>&1; then
+            log_warn "Не найдено: $t — пропускаю."
+            return 0
+        fi
+    done
+
+    if ! auto_network_ok; then
+        log_info 'Нет сети — пропускаю.'
+        return 0
+    fi
+
+    local sm
+    sm="$(auto_get AUTO_SHELL apply)"
+    if [[ "$sm" != off ]]; then
+        auto_shell_step "$sm" || true
+    fi
+
+    auto_system_step || true
+    return 0
+}
+
+auto_run_once() {
+    AUTO_MODE=1
+
+    if ! acquire_lock_quiet; then
+        log_info 'linka сейчас занята (другой терминал/обновление) — пропускаю.'
+        return 0
+    fi
+
+    auto_run_body || true
+    release_lock
+    return 0
+}
+
+auto_run_cli() {
+    local a verbose=0
+    for a in "$@"; do
+        case "$a" in
+            -v|--verbose) verbose=1 ;;
+        esac
+    done
+
+    AUTO_MODE=1
+    if [[ "$verbose" != 1 ]]; then
+        auto_setup_log
+    fi
+
+    auto_run_once
+    return 0
+}
+
+# ---------- планировщик ----------
+auto_script_path() {
+    readlink -f "${BASH_SOURCE[0]:-$0}"
+}
+
+auto_have_systemd_user() {
+    [[ "$(detect_init_system)" == systemd ]] &&
+        command -v systemctl >/dev/null 2>&1 &&
+        systemctl --user show-environment >/dev/null 2>&1
+}
+
+auto_systemd_install() {
+    local script="$1" minutes="$2"
+
+    mkdir -p "$AUTO_UNIT_DIR"
+
+    cat > "$AUTO_UNIT_DIR/linka-auto.service" <<EOF_SVC
+[Unit]
+Description=linka: фоновое обновление Serpantinum и системы
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/env bash "$script" auto run
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+Nice=15
+IOSchedulingClass=idle
+TimeoutStartSec=infinity
+EOF_SVC
+
+    cat > "$AUTO_UNIT_DIR/linka-auto.timer" <<EOF_TMR
+[Unit]
+Description=linka: периодическая проверка обновлений
+
+[Timer]
+OnActiveSec=10min
+OnUnitActiveSec=${minutes}min
+RandomizedDelaySec=5min
+
+[Install]
+WantedBy=timers.target
+EOF_TMR
+
+    systemctl --user daemon-reload || return 1
+    systemctl --user enable --now linka-auto.timer || return 1
+    return 0
+}
+
+auto_systemd_remove() {
+    if command -v systemctl >/dev/null 2>&1; then
+        systemctl --user disable --now linka-auto.timer >/dev/null 2>&1 || true
+        systemctl --user stop linka-auto.service >/dev/null 2>&1 || true
+    fi
+
+    rm -f "$AUTO_UNIT_DIR/linka-auto.service" "$AUTO_UNIT_DIR/linka-auto.timer"
+
+    if command -v systemctl >/dev/null 2>&1; then
+        systemctl --user daemon-reload >/dev/null 2>&1 || true
+    fi
+    return 0
+}
+
+auto_daemon_pid() {
+    local pid=""
+    if [[ -f "$AUTO_PID_FILE" ]]; then
+        pid="$(cat "$AUTO_PID_FILE" 2>/dev/null || true)"
+    fi
+
+    if [[ "$pid" =~ ^[0-9]+$ ]] && kill -0 "$pid" 2>/dev/null &&
+       grep -q 'daemon' "/proc/$pid/cmdline" 2>/dev/null; then
+        printf '%s\n' "$pid"
+    fi
+    return 0
+}
+
+auto_daemon_start() {
+    local script="$1"
+
+    if [[ -n "$(auto_daemon_pid)" ]]; then
+        return 0
+    fi
+
+    if command -v setsid >/dev/null 2>&1; then
+        setsid -f bash "$script" auto daemon </dev/null >/dev/null 2>&1 || true
+    else
+        nohup bash "$script" auto daemon </dev/null >/dev/null 2>&1 &
+        disown 2>/dev/null || true
+    fi
+    return 0
+}
+
+auto_daemon_stop() {
+    local pid
+    pid="$(auto_daemon_pid)"
+    if [[ -n "$pid" ]]; then
+        kill "$pid" 2>/dev/null || true
+    fi
+    rm -f "$AUTO_PID_FILE"
+    return 0
+}
+
+# Цикл для систем без user-таймеров. Автозапуск — XDG autostart (для Hyprland/
+# sway/niri без xdg-autostart добавьте в конфиг композитора:  exec-once = linka auto daemon).
+auto_daemon() {
+    local minutes secs
+
+    if command -v flock >/dev/null 2>&1; then
+        exec 8>"$AUTO_DAEMON_LOCK" || true
+        if ! flock -n 8; then
+            return 0
+        fi
+    fi
+
+    mkdir -p "$STATE_DIR"
+    printf '%s\n' "$$" > "$AUTO_PID_FILE"
+    trap 'kill "${AUTO_SLEEP_PID:-0}" 2>/dev/null || true; rm -f "$AUTO_PID_FILE"; cleanup_terminal' EXIT
+
+    # Дать сессии подняться.
+    sleep "${LINKA_AUTO_FIRST_DELAY:-300}" & AUTO_SLEEP_PID=$!
+    wait "$AUTO_SLEEP_PID" || true
+
+    while true; do
+        # Подоболочка: сбой одного прохода не должен убивать демон.
+        ( auto_run_cli ) || true
+
+        minutes="$(auto_get AUTO_INTERVAL_MIN 15)"
+        [[ "$minutes" =~ ^[0-9]+$ ]] || minutes=15
+        secs=$(( 10#$minutes * 60 ))
+
+        # sleep & wait, а не просто sleep: иначе TERM обрабатывался бы только
+        # после окончания многочасового сна.
+        sleep "${LINKA_AUTO_LOOP_SECS:-$secs}" & AUTO_SLEEP_PID=$!
+        wait "$AUTO_SLEEP_PID" || true
+    done
+}
+
+auto_status() {
+    local sh sys mins days nt br last
+    local script
+
+    sh="$(auto_get AUTO_SHELL apply)"
+    sys="$(auto_get AUTO_SYSTEM off)"
+    mins="$(auto_get AUTO_INTERVAL_MIN 15)"
+    days="$(auto_get AUTO_SYSTEM_EVERY_DAYS 1)"
+    nt="$(auto_get AUTO_NOTIFY 1)"
+    br="$(auto_get AUTO_BRANCH "$REPO_BRANCH")"
+    last="$(auto_get AUTO_LAST_SYSTEM 0)"
+    script="$(auto_script_path || true)"
+
+    printf '%sАвтообновление linka%s\n' "$BOLD" "$RESET"
+
+    if auto_have_systemd_user; then
+        if systemctl --user is-enabled linka-auto.timer >/dev/null 2>&1; then
+            printf '  планировщик:   systemd --user таймер (включён, %s)\n' \
+                "$(systemctl --user is-active linka-auto.timer 2>/dev/null || true)"
+            systemctl --user list-timers linka-auto.timer --no-pager 2>/dev/null | sed -n '1,2p' | sed 's/^/                 /' || true
+        else
+            printf '  планировщик:   выключен\n'
+        fi
+    else
+        if [[ -n "$(auto_daemon_pid)" ]]; then
+            printf '  планировщик:   демон (pid %s)\n' "$(auto_daemon_pid)"
+        elif [[ -f "$AUTO_AUTOSTART_FILE" ]]; then
+            printf '  планировщик:   автозапуск настроен, демон сейчас не работает\n'
+        else
+            printf '  планировщик:   выключен\n'
+        fi
+    fi
+
+    printf '  Serpantinum:   %s (ветка %s)\n' "$sh" "$br"
+    printf '  система:       %s (раз в %s дн.)\n' "$sys" "$days"
+    printf '  проверка:      каждые %s мин.\n' "$mins"
+    printf '  уведомления:   %s\n' "$([[ "$nt" == 1 ]] && printf да || printf нет)"
+
+    if [[ "$last" =~ ^[0-9]+$ && "$last" -gt 0 ]]; then
+        printf '  последнее обновление системы: %s\n' "$(date -d "@$last" '+%F %T' 2>/dev/null || printf '%s' "$last")"
+    fi
+
+    if [[ "$sys" != off ]]; then
+        if auto_sudo_ok "$sys"; then
+            printf '  sudo без пароля: есть\n'
+        else
+            printf '  sudo без пароля: НЕТ — linka auto enable --system %s\n' "$sys"
+        fi
+    fi
+
+    if [[ -n "$script" && ! -f "$script" ]]; then
+        printf '  ВНИМАНИЕ: файл скрипта не найден: %s\n' "$script"
+    fi
+
+    if [[ -f "$AUTO_LOG" ]]; then
+        printf '\n  Журнал (%s):\n' "$AUTO_LOG"
+        tail -n 6 "$AUTO_LOG" 2>/dev/null | sed 's/^/    /' || true
+    fi
+
+    return 0
+}
+
+auto_enable() {
+    local shell_mode sys_mode minutes days notify branch prev_sys script
+
+    shell_mode="$(auto_get AUTO_SHELL apply)"
+    sys_mode="$(auto_get AUTO_SYSTEM off)"
+    minutes="$(auto_get AUTO_INTERVAL_MIN 15)"
+    days="$(auto_get AUTO_SYSTEM_EVERY_DAYS 1)"
+    notify="$(auto_get AUTO_NOTIFY 1)"
+    branch="$(auto_get AUTO_BRANCH "$REPO_BRANCH")"
+    prev_sys="$sys_mode"
+
+    # Ветку берём из окружения, только если её задали явно.
+    if [[ -n "${SERPANTINUM_BRANCH:-}" ]]; then
+        branch="$SERPANTINUM_BRANCH"
+    fi
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --shell)      shell_mode="${2:-}"; shift 2 || shift ;;
+            --system)     sys_mode="${2:-}"; shift 2 || shift ;;
+            --interval)   minutes="${2:-}"; shift 2 || shift ;;
+            --every-days) days="${2:-}"; shift 2 || shift ;;
+            --no-notify)  notify=0; shift ;;
+            --notify)     notify=1; shift ;;
+            *)
+                log_error "auto enable: неизвестный параметр: $1"
+                usage
+                return 1
+                ;;
+        esac
+    done
+
+    if ! auto_valid_mode "$shell_mode"; then
+        log_error '--shell: apply | notify | off'
+        return 1
+    fi
+    if ! auto_valid_mode "$sys_mode"; then
+        log_error '--system: apply | notify | off'
+        return 1
+    fi
+    if ! auto_valid_uint "$minutes"; then
+        log_error '--interval: целое число минут > 0'
+        return 1
+    fi
+    if ! auto_valid_uint "$days"; then
+        log_error '--every-days: целое число дней > 0'
+        return 1
+    fi
+
+    script="$(auto_script_path)"
+    if [[ ! -f "$script" || "$script" == /dev/* || "$script" == /proc/* ]]; then
+        log_error 'Не могу определить путь к linka: запустите её из файла (не через pipe/process substitution).'
+        return 1
+    fi
+    case "$script" in
+        /tmp/*|/var/tmp/*)
+            log_warn "linka лежит в $script — временный каталог может очиститься, и автообновление перестанет работать."
+            ;;
+    esac
+
+    # Пакеты ОС: если нужны root-права — ставим узкое правило sudoers.
+    local need_sudo=false
+    if [[ -n "$(auto_privileged_commands "$sys_mode")" ]]; then
+        need_sudo=true
+    fi
+
+    if [[ "$need_sudo" == true ]]; then
+        start_sudo_keepalive
+        if ! auto_install_sudoers "$sys_mode"; then
+            log_warn 'Обновление системы отключено (не удалось настроить sudo). Остальное включится.'
+            sys_mode=off
+        fi
+    elif [[ "$prev_sys" != off ]]; then
+        # Раньше было шире — убираем старое правило, чтобы оно не висело зря.
+        start_sudo_keepalive
+        run_optional_root rm -f "$AUTO_SUDOERS_FILE" || true
+    fi
+
+    auto_set AUTO_SHELL "$shell_mode"
+    auto_set AUTO_SYSTEM "$sys_mode"
+    auto_set AUTO_INTERVAL_MIN "$minutes"
+    auto_set AUTO_SYSTEM_EVERY_DAYS "$days"
+    auto_set AUTO_NOTIFY "$notify"
+    auto_set AUTO_BRANCH "$branch"
+
+    if auto_have_systemd_user; then
+        auto_daemon_stop
+        rm -f "$AUTO_AUTOSTART_FILE"
+        if auto_systemd_install "$script" "$minutes"; then
+            log_ok "Включено: systemd --user таймер linka-auto.timer (каждые ${minutes} мин., первый запуск через ~10 мин)."
+        else
+            log_error 'Не удалось включить systemd-таймер.'
+            return 1
+        fi
+    else
+        auto_systemd_remove
+        mkdir -p "$(dirname "$AUTO_AUTOSTART_FILE")"
+        cat > "$AUTO_AUTOSTART_FILE" <<EOF_DESK
+[Desktop Entry]
+Type=Application
+Name=linka auto-update
+Comment=Фоновое обновление Serpantinum
+Exec=bash "$script" auto daemon
+Terminal=false
+NoDisplay=true
+X-GNOME-Autostart-enabled=true
+EOF_DESK
+        auto_daemon_stop
+        auto_daemon_start "$script"
+        log_ok "Включено: фоновый демон (каждые ${minutes} мин.), автозапуск: $AUTO_AUTOSTART_FILE"
+        log_info 'Если композитор не читает XDG autostart — добавьте в его конфиг:  exec-once = linka auto daemon'
+        log_info 'Для exec-once нужна команда linka в PATH: ln -s "'"$script"'" ~/.local/bin/linka'
+    fi
+
+    log_info "Serpantinum: $shell_mode | система: $sys_mode | журнал: $AUTO_LOG"
+    return 0
+}
+
+auto_disable() {
+    local quiet=false prev_sys
+    if [[ "${1:-}" == --quiet ]]; then
+        quiet=true
+    fi
+
+    prev_sys="$(auto_get AUTO_SYSTEM off)"
+
+    auto_systemd_remove
+    auto_daemon_stop
+    rm -f "$AUTO_AUTOSTART_FILE"
+
+    if [[ "$prev_sys" != off || -f "$AUTO_CONF" ]]; then
+        start_sudo_keepalive
+        run_optional_root rm -f "$AUTO_SUDOERS_FILE" || true
+    fi
+
+    rm -f "$AUTO_CONF"
+
+    if [[ "$quiet" != true ]]; then
+        log_ok 'Автообновление выключено.'
+    fi
+    return 0
+}
+
+auto_menu() {
+    local c=''
+
+    clear 2>/dev/null || true
+    auto_status
+    printf '\n  [e] включить (по умолчанию)   [d] выключить   [Enter] назад: '
+    read -rn1 c || true
+    printf '\n'
+
+    case "$c" in
+        e|E) auto_enable || true ;;
+        d|D) auto_disable || true ;;
+    esac
+    return 0
+}
+
+auto_main() {
+    local sub="${1:-status}"
+    if [[ $# -gt 0 ]]; then
+        shift
+    fi
+
+    case "$sub" in
+        enable)  auto_enable "$@"; end_session ;;
+        disable) auto_disable "$@"; end_session ;;
+        status)  auto_status ;;
+        run)     auto_run_cli "$@" ;;
+        daemon)  auto_daemon ;;
+        *)
+            log_error "auto: неизвестная подкоманда: $sub"
+            usage
+            exit 1
+            ;;
+    esac
+    return 0
+}
+
+usage() {
+    cat <<EOF_USAGE
+linka ${LINKA_VERSION} — Serpantinum installer (Fedora/Gentoo)
+
+  linka                       меню
+  linka install               установка (поверх существующей — без затирания конфигов)
+  linka reinstall             чистая переустановка (конфиги бэкапятся)
+  linka update                обновление
+  linka update --force        принудительное обновление поверх текущего коммита
+  linka remove                удаление
+  linka kill                  остановка
+
+Фоновое автообновление:
+  linka auto enable [опции]   включить (таймер systemd --user или демон)
+  linka auto disable          выключить
+  linka auto status           состояние и последние строки журнала
+  linka auto run [-v]         один проход (его вызывает таймер); -v — вывод на экран
+  linka auto daemon           цикл в фоне (для систем без systemd --user)
+
+  Опции auto enable:
+    --shell apply|notify|off  Serpantinum: обновлять сам / только уведомлять / не трогать (apply)
+    --system off|notify|apply пакеты ОС (dnf / emerge): не трогать / уведомлять / обновлять (off)
+    --interval МИНУТЫ         как часто проверять (15)
+    --every-days ДНИ          как часто трогать пакеты ОС (1)
+    --no-notify               без уведомлений
+
+Переменные окружения:
+  SERPANTINUM_BRANCH=master   ветка репозитория (по умолчанию master)
+  SERPANTINUM_FORCE_UPDATE=1  то же, что update --force
+  SERPANTINUM_MATUGEN_COMPAT=0  отключить автоправку совместимости с matugen
+  LINKA_BACKUP_KEEP=5         сколько последних бэкапов хранить (0 — не удалять)
+EOF_USAGE
+}
+
+linka_main_menu() {
+    if [[ ! -t 0 ]]; then
+        log_warn 'Нет интерактивного TTY.'
+        usage
+        return 0
+    fi
+
+    local cursor=0
+    local k
+
+    while true; do
+        draw_menu "$DISTRO | $(detect_install_state)" "$cursor" \
+            'Установка' 'Переустановка' 'Обновление' 'Удаление' 'Kill' 'Автообновление' 'Выход'
+
+        k="$(read_key)"
+
+        case "$k" in
+            UP)
+                if [[ "$cursor" -gt 0 ]]; then
+                    cursor=$((cursor-1))
+                else
+                    cursor=6
+                fi
+                ;;
+            DOWN)
+                if [[ "$cursor" -lt 6 ]]; then
+                    cursor=$((cursor+1))
+                else
+                    cursor=0
+                fi
+                ;;
+            ENTER|SPACE)
+                case "$cursor" in
+                    0)
+                        FORCE_UPDATE=0
+                        prepare_environment
+                        flow_install install || true
+                        end_session
+                        read -r -p 'Enter...' _ || true
+                        ;;
+                    1)
+                        FORCE_UPDATE=0
+                        prepare_environment
+                        flow_install reinstall || true
+                        end_session
+                        read -r -p 'Enter...' _ || true
+                        ;;
+                    2)
+                        FORCE_UPDATE=0
+                        prepare_environment
+                        flow_update || true
+                        end_session
+                        read -r -p 'Enter...' _ || true
+                        ;;
+                    3)
+                        emergency_remove || true
+                        end_session
+                        read -r -p 'Enter...' _ || true
+                        ;;
+                    4)
+                        kill_serpantinum || true
+                        end_session
+                        read -r -p 'Enter...' _ || true
+                        ;;
+                    5)
+                        auto_menu || true
+                        end_session
+                        read -r -p 'Enter...' _ || true
+                        ;;
+                    6)
+                        return 0
+                        ;;
+                esac
+                ;;
+            ESC|q)
+                return 0
+                ;;
+        esac
+    done
+}
+
+main() {
+    case "${1:-}" in
+        -h|--help)
+            usage
+            ;;
+        install|--install)
+            prepare_environment
+            flow_install install
+            ;;
+        reinstall|--reinstall)
+            prepare_environment
+            flow_install reinstall
+            ;;
+        update|--update)
+            if [[ "${2:-}" == "--force" || "${2:-}" == "-f" ]]; then
+                FORCE_UPDATE=1
+            fi
+
+            prepare_environment
+            flow_update
+            ;;
+        remove|--remove|uninstall|--uninstall)
+            emergency_remove
+            ;;
+        kill|--kill)
+            kill_serpantinum
+            ;;
+        auto|--auto)
+            shift
+            auto_main "$@"
+            ;;
+        '')
+            linka_main_menu
+            ;;
+        *)
+            log_error "Неизвестный аргумент: $1"
+            usage
+            exit 1
+            ;;
+    esac
+}
+
+case "${1:-}" in
+    -h|--help) ;;
+    *) preflight ;;
+esac
+
+main "$@"
