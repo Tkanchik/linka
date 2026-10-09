@@ -763,11 +763,26 @@ start_shell() {
         return 1
     fi
 
-    if ! run_serpantinumd "$bin" start; then
-        log_warn "serpantinumd start не удался ($bin)"
-        return 1
+    # serpantinumd start ждёт завершения quickshell (wait $QS_PID).
+    # Запускаем в фоне с отрывом дескрипторов (nohup / 9>&- 8>&- &), чтобы
+    # вызывающий процесс (в т.ч. автообновление) не зависал с блокировкой.
+    nohup run_serpantinumd "$bin" start </dev/null >/dev/null 2>&1 &
+    local d_pid=$!
+    disown "$d_pid" 2>/dev/null || true
+
+    local i
+    for i in 1 2 3 4 5; do
+        if shell_running; then
+            return 0
+        fi
+        sleep 0.5
+    done
+
+    if shell_running; then
+        return 0
     fi
 
+    log_warn "serpantinumd запущен, но статус shell пока не подтверждён ($bin)"
     return 0
 }
 
@@ -3697,7 +3712,7 @@ auto_disable() {
     auto_daemon_stop
     rm -f "$AUTO_AUTOSTART_FILE"
 
-    if [[ "$prev_sys" != off || -f "$AUTO_CONF" ]]; then
+    if [[ "$prev_sys" != off && -f "$AUTO_SUDOERS_FILE" ]]; then
         start_sudo_keepalive
         run_optional_root rm -f "$AUTO_SUDOERS_FILE" || true
     fi
