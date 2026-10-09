@@ -2236,7 +2236,7 @@ EOF
     local OSC8_GH=$'\e]8;;'"${LINKA_GH}"$'\a'
     local OSC8_TW=$'\e]8;;https://twitter.com/ilyamirox\a'
     local OSC8_RD=$'\e]8;;https://reddit.com/u/ilyamiro1\a'
-    local OSC8_TG=$'\e]8;;https://t.me/stewart_github\a'
+    local OSC8_TG=$'\e]8;;https://t.me/serpantinum_git\a'
     local OSC8_KF=$'\e]8;;https://ko-fi.com/ilyamiro\a'
     local OSC8_END=$'\e]8;;\a'
 
@@ -2268,7 +2268,7 @@ EOF
     printf "\033[K%s--------------------------------------------------------------------------------%s\n" "$C_BLUE" "$RESET"
     printf "\033[K%s%-12s%s %s%s%s\n" "$BOLD" "GitHub:" "$RESET" "$OSC8_GH" "$LINKA_GH" "$OSC8_END"
     printf "\033[K%s%-12s%s %s@ilyamirox%s  |  %s%sReddit:%s %su/ilyamiro1%s\n" "$BOLD" "Twitter:" "$RESET" "$OSC8_TW" "$OSC8_END" "$BOLD" "$C_RED" "$RESET" "$OSC8_RD" "$OSC8_END"
-    printf "\033[K%s%-12s%s %shttps://t.me/stewart_github%s\n" "$BOLD" "Telegram:" "$RESET" "$OSC8_TG" "$OSC8_END"
+    printf "\033[K%s%-12s%s %shttps://t.me/serpantinum_git%s\n" "$BOLD" "Telegram:" "$RESET" "$OSC8_TG" "$OSC8_END"
     printf "\033[K%s%-12s%s %shttps://ko-fi.com/ilyamiro (Поддержите проект!)%s\n" "$BOLD" "Поддержать:" "$RESET" "$OSC8_KF" "$OSC8_END"
     printf "\033[K%s--------------------------------------------------------------------------------%s\n" "$C_BLUE" "$RESET"
     printf "\033[K%sПользователь:%s %-25s | %sОС:%s %s\n" "$BOLD" "$RESET" "$user_name" "$BOLD" "$RESET" "$os_name"
