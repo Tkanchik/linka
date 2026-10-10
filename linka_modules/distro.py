@@ -21,13 +21,14 @@ class GentooManager(DistroManager):
     name = "gentoo"
 
     def is_pkg_installed(self, pkg: str) -> bool:
-        # qlist -I <pkg> или eix -I <pkg>
+        # portageq has_version / <pkg> — штатный способ в Gentoo
+        if shutil.which("portageq"):
+            ret, _, _ = run_cmd(["portageq", "has_version", "/", pkg], capture=True)
+            return ret == 0
         if shutil.which("qlist"):
-            ret, out, _ = run_cmd(["qlist", "-I", "-e", pkg], capture=True)
+            ret, out, _ = run_cmd(["qlist", "-I", pkg], capture=True)
             return ret == 0 and bool(out)
-        # fallback: проверка через emerge -p
-        ret, _, _ = run_cmd(f"emerge -p ={pkg} 2>/dev/null", capture=True)
-        return ret == 0
+        return False
 
     def install_packages(self, pkgs: List[str]) -> bool:
         if not pkgs:

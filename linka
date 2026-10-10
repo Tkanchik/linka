@@ -270,7 +270,8 @@ init_package_lists() {
         # xdg-desktop-portal-gtk и qt6ct указаны оба варианта.
         REQUIRED_PKGS=(
             dev-vcs/git media-libs/zbar media-sound/pavucontrol media-sound/alsa-utils
-            gui-apps/wl-clipboard sys-apps/fd app-text/ripgrep gui-apps/cliphist
+            gui-apps/wl-clipboard sys-apps/fd app-text/ripgrep
+            app-misc/cliphist gui-apps/cliphist
             app-misc/jq net-misc/socat sys-fs/inotify-tools media-sound/pamixer
             sys-apps/brightnessctl sys-apps/ddcutil sys-power/acpi net-wireless/iw
             net-wireless/bluez x11-libs/libnotify net-misc/networkmanager
@@ -285,8 +286,10 @@ init_package_lists() {
             gui-apps/qt6ct x11-misc/qt6ct
             dev-qt/qtdeclarative dev-qt/qtsvg dev-qt/qtshadertools
             media-video/wf-recorder x11-themes/adw-gtk-theme media-video/gpu-screen-recorder
-            x11-terms/kitty media-sound/cava gui-apps/quickshell media-gfx/matugen
-            media-gfx/satty gui-apps/wl-gammarelay-rs sys-power/power-profiles-daemon
+            x11-terms/kitty media-sound/cava gui-apps/quickshell
+            x11-misc/matugen media-gfx/matugen
+            gui-apps/satty media-gfx/satty
+            gui-apps/wl-gammarelay-rs sys-power/power-profiles-daemon
         )
         SDDM_PKGS=(x11-misc/sddm dev-qt/qtdeclarative dev-qt/qtsvg)
         OPTIONAL_PKGS=()
@@ -925,8 +928,12 @@ gentoo_sync_tree() {
 # в одном подключённом репозитории. Если пути репозиториев определить не
 # удалось — печатает все атомы как есть.
 gentoo_filter_atoms() {
+    if [[ $# -eq 0 ]]; then
+        return 0
+    fi
+
     local repo_paths=() out=() miss=()
-    local r rp atom c p found
+    local r rp atom c p found clean_atom
 
     if command -v portageq >/dev/null 2>&1; then
         for r in $(portageq get_repos / 2>/dev/null || true); do
@@ -943,9 +950,11 @@ gentoo_filter_atoms() {
     fi
 
     for atom in "$@"; do
-        c="${atom%%/*}"
-        p="${atom##*/}"
+        clean_atom="${atom#[><=~]}"
+        c="${clean_atom%%/*}"
+        p="${clean_atom##*/}"
         p="${p%%:*}"
+        p="${p%%-[0-9]*}"
         found=0
 
         for rp in "${repo_paths[@]}"; do
@@ -968,7 +977,7 @@ gentoo_filter_atoms() {
 
     if [[ ${#out[@]} -gt 0 ]]; then
         printf '%s\n' "${out[@]}"
-    else
+    elif [[ $# -gt 0 ]]; then
         printf '%s\n' "$@"
     fi
 
@@ -1124,12 +1133,25 @@ install_dependencies() {
     else
         target_list=("${REQUIRED_PKGS[@]}")
 
-        run_root mkdir -p /etc/portage/package.use || log_warn 'Gentoo: не удалось создать /etc/portage/package.use'
-
-        run_root tee /etc/portage/package.use/serpantinum >/dev/null <<'EOF_USE' || log_warn 'Gentoo: не удалось записать package.use/serpantinum'
+        if [[ -d /etc/portage/package.use ]]; then
+            run_root tee /etc/portage/package.use/serpantinum >/dev/null <<'EOF_USE' || log_warn 'Gentoo: не удалось записать package.use/serpantinum'
 media-video/pipewire dbus extra
 dev-qt/qtmultimedia qml ffmpeg
 EOF_USE
+        elif [[ -f /etc/portage/package.use ]]; then
+            local uflag
+            for uflag in "media-video/pipewire dbus extra" "dev-qt/qtmultimedia qml ffmpeg"; do
+                if ! grep -Fxq "$uflag" /etc/portage/package.use 2>/dev/null; then
+                    printf '%s\n' "$uflag" | run_root tee -a /etc/portage/package.use >/dev/null || true
+                fi
+            done
+        else
+            run_root mkdir -p /etc/portage/package.use || log_warn 'Gentoo: не удалось создать /etc/portage/package.use'
+            run_root tee /etc/portage/package.use/serpantinum >/dev/null <<'EOF_USE' || log_warn 'Gentoo: не удалось записать package.use/serpantinum'
+media-video/pipewire dbus extra
+dev-qt/qtmultimedia qml ffmpeg
+EOF_USE
+        fi
 
         gentoo_ensure_guru
         gentoo_sync_tree
@@ -1682,6 +1704,10 @@ deploy_package() {
         deploy_full "$repo" "$iu" || return 1
     fi
 
+    if [[ -f "$TARGET_BASE/bin/serpantinum" || -f "$TARGET_BASE/bin/serpantinumd" ]]; then
+        run_optional_root mkdir -p /usr/local/bin || true
+    fi
+
     if [[ -f "$TARGET_BASE/bin/serpantinum" ]]; then
         ln -sfn "$TARGET_BASE/bin/serpantinum" "$BIN_DIR/serpantinum"
         run_optional_root ln -sfn "$TARGET_BASE/bin/serpantinum" /usr/local/bin/serpantinum || true
@@ -2006,7 +2032,7 @@ rotate_backups() {
         return 0
     fi
 
-    for prefix in update target configs; do
+    for prefix in update target configs removed; do
         list=()
         mapfile -t list < <(find "$BACKUP_BASE" -mindepth 1 -maxdepth 1 -type d -name "${prefix}.[0-9]*" 2>/dev/null | sort)
 
@@ -2315,17 +2341,18 @@ EOF
 show_package_overview() {
     local target_list=("${REQUIRED_PKGS[@]}")
     for comp in "${SELECTED_COMPOSITORS[@]}"; do
-        case "$comp" in
-            niri)
-                if [[ "$DISTRO" == "gentoo" ]]; then target_list+=("gui-apps/niri"); else target_list+=("niri"); fi ;;
-            hyprland)
-                if [[ "$DISTRO" == "gentoo" ]]; then target_list+=("gui-apps/hyprland"); else target_list+=("hyprland"); fi ;;
-            sway)
-                if [[ "$DISTRO" == "gentoo" ]]; then target_list+=("gui-apps/sway"); else target_list+=("sway"); fi ;;
-        esac
+        target_list+=("$(comp_atom "$comp")")
     done
     if [[ "$OPT_SDDM" == true ]]; then
         target_list+=("${SDDM_PKGS[@]}")
+    fi
+
+    if [[ "$DISTRO" == "gentoo" ]]; then
+        local filtered=()
+        mapfile -t filtered < <(gentoo_filter_atoms "${target_list[@]}")
+        if [[ ${#filtered[@]} -gt 0 && -n "${filtered[0]}" ]]; then
+            target_list=("${filtered[@]}")
+        fi
     fi
 
     local overview_items=()
@@ -2403,13 +2430,13 @@ manage_compositors_menu() {
     local sel
     local st_hypr="не установлен" st_niri="не установлен" st_sway="не установлен"
 
-    if command -v hyprland &>/dev/null || command -v Hyprland &>/dev/null || pkg_installed gui-apps/hyprland 2>/dev/null; then
+    if command -v hyprland &>/dev/null || command -v Hyprland &>/dev/null || pkg_installed "$(comp_atom hyprland)" 2>/dev/null; then
         st_hypr="установлен"
     fi
-    if command -v niri &>/dev/null || pkg_installed gui-apps/niri 2>/dev/null; then
+    if command -v niri &>/dev/null || pkg_installed "$(comp_atom niri)" 2>/dev/null; then
         st_niri="установлен"
     fi
-    if command -v sway &>/dev/null || pkg_installed gui-apps/sway 2>/dev/null; then
+    if command -v sway &>/dev/null || pkg_installed "$(comp_atom sway)" 2>/dev/null; then
         st_sway="установлен"
     fi
 
@@ -2839,11 +2866,14 @@ emergency_remove() {
         rm -rf "$USER_FONT_DIR"
     fi
 
-    # sddm отключаем только если его включила сама linka: иначе можно
-    # оставить человека без экрана входа.
-    if [[ "$sddm_ours" == true ]] && command -v systemctl >/dev/null 2>&1; then
-        run_optional_root systemctl disable sddm.service || true
-        log_warn 'sddm.service отключён — при следующей загрузке нужен другой способ входа (или включите свой DM).'
+    if [[ "$sddm_ours" == true ]]; then
+        if [[ "$(detect_init_system)" == systemd ]] && command -v systemctl >/dev/null 2>&1; then
+            run_optional_root systemctl disable sddm.service || true
+            log_warn 'sddm.service отключён — при следующей загрузке нужен другой способ входа (или включите свой DM).'
+        elif [[ "$(detect_init_system)" == openrc ]] && command -v rc-update >/dev/null 2>&1; then
+            run_optional_root rc-update del sddm default 2>/dev/null || run_optional_root rc-update del display-manager default 2>/dev/null || true
+            log_warn 'sddm удалён из автозапуска OpenRC — при следующей загрузке нужен другой способ входа.'
+        fi
     fi
 
     rm -f "$STATE_FILE" "$STATE_DIR/version" "$STATE_DIR/.last-update-backup" 2>/dev/null || true
@@ -3158,8 +3188,7 @@ auto_install_sudoers() {
     done < <(auto_privileged_commands "$mode")
 
     if [[ ${#rules[@]} -eq 0 ]]; then
-        log_error 'Не удалось определить команды для sudoers (нет dnf/emerge?).'
-        return 1
+        return 0
     fi
 
     local joined="" r
@@ -3179,6 +3208,8 @@ auto_install_sudoers() {
         rm -f "$tmp"
         return 1
     fi
+
+    run_root mkdir -p "$(dirname "$AUTO_SUDOERS_FILE")" 2>/dev/null || true
 
     if ! run_root install -m 0440 -o root -g root "$tmp" "$AUTO_SUDOERS_FILE"; then
         log_error "Не удалось установить $AUTO_SUDOERS_FILE"
@@ -3623,6 +3654,7 @@ auto_enable() {
             --system)     sys_mode="${2:-}"; shift 2 || shift ;;
             --interval)   minutes="${2:-}"; shift 2 || shift ;;
             --every-days) days="${2:-}"; shift 2 || shift ;;
+            --branch)     branch="${2:-}"; shift 2 || shift ;;
             --no-notify)  notify=0; shift ;;
             --notify)     notify=1; shift ;;
             *)
@@ -3829,11 +3861,6 @@ linka_main_menu() {
     TARGET_COMMIT="$(get_installed_commit 2>/dev/null || echo "unknown")"
     INSTALL_STATE="$(detect_install_state)"
 
-    cleanup_terminal() {
-        printf "\e[?25h" 2>/dev/null || true
-        stty echo icanon 2>/dev/null || true
-    }
-    trap cleanup_terminal EXIT INT TERM
 
     local cursor=0
     if [[ "$INSTALL_STATE" == "current" ]]; then
@@ -4044,7 +4071,7 @@ linka_main_menu() {
                             ;;
                     esac
                     ;;
-                [kK])
+                [sS]|kill)
                     cleanup_terminal
                     kill_serpantinum || true
                     end_session

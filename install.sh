@@ -43,4 +43,4 @@ if [ ! -t 0 ] && [ -e /dev/tty ]; then
     exec < /dev/tty
 fi
 
-exec "${LINKA_SYMLINK}" "${@:-}"
+exec "${LINKA_SYMLINK}" "$@"
