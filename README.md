@@ -84,4 +84,5 @@ linka auto enable --shell notify
 - Оболочка **Serpantinum**: [ilyamiro/serpantinum](https://github.com/ilyamiro/serpantinum)
 - Движок интерфейса: [Quickshell](https://quickshell.outfoxxed.me/)
 
-Лицензия проекта — **GNU Affero General Public License v3.0 (AGPL-3.0)**, как и у оригинального Serpantinum.
+Лицензия проекта — **GNU Affero General Public License v3.0 (AGPL-3.0)**
+
