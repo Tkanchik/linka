@@ -736,6 +736,7 @@ stop_shell() {
 
     for i in 1 2 3 4 5; do
         if ! shell_running; then
+            rm -f "/tmp/serpantinumd.pid" "/tmp/serpantinumd.lock" 2>/dev/null || true
             return 0
         fi
         sleep 1
@@ -747,6 +748,7 @@ stop_shell() {
 
     for i in 1 2 3; do
         if ! shell_running; then
+            rm -f "/tmp/serpantinumd.pid" "/tmp/serpantinumd.lock" 2>/dev/null || true
             return 0
         fi
         sleep 1
@@ -760,6 +762,7 @@ stop_shell() {
 
     for i in 1 2 3; do
         if ! shell_running; then
+            rm -f "/tmp/serpantinumd.pid" "/tmp/serpantinumd.lock" 2>/dev/null || true
             return 0
         fi
         sleep 1
@@ -772,6 +775,11 @@ start_shell() {
     fc-cache -f >/dev/null 2>&1 || true
     export PATH="$BIN_DIR:$PATH"
 
+    # Если переменные сессии не заданы (фоновый таймер systemd, чистый tty), пробуем подтянуть их
+    if [[ -z "${WAYLAND_DISPLAY:-}" || -z "${XDG_RUNTIME_DIR:-}" ]]; then
+        auto_adopt_session_env || true
+    fi
+
     local bin
     bin="$(find_serpantinumd || true)"
 
@@ -781,13 +789,35 @@ start_shell() {
     fi
 
     # serpantinumd start ждёт завершения quickshell (wait $QS_PID).
-    # Запускаем в фоне с отрывом дескрипторов (nohup env ... / 9>&- 8>&- &), чтобы
-    # вызывающий процесс (в т.ч. автообновление) не зависал с блокировкой.
-    # Вызываем напрямую утилиту env, так как внешний бинарник nohup не может
-    # вызвать функцию bash (run_serpantinumd).
-    nohup env -u SERPANTINUM_DIR -u QS_DIR -u MAIN_QML "$bin" start </dev/null >/dev/null 2>&1 9>&- 8>&- &
-    local d_pid=$!
-    disown "$d_pid" 2>/dev/null || true
+    # Запускаем с полным отрывом от текущей cgroup/сессии/терминала, чтобы:
+    # 1) при завершении linka-auto.service systemd не убивал shell вместе со службой;
+    # 2) при закрытии терминала shell не падал вместе со scope терминала.
+    local started=0
+    if command -v systemd-run >/dev/null 2>&1 && systemctl --user list-units >/dev/null 2>&1; then
+        local env_args=()
+        local v
+        for v in WAYLAND_DISPLAY DISPLAY XDG_RUNTIME_DIR XDG_CURRENT_DESKTOP XDG_SESSION_TYPE \
+                 DESKTOP_SESSION DBUS_SESSION_BUS_ADDRESS HYPRLAND_INSTANCE_SIGNATURE SWAYSOCK \
+                 NIRI_SOCKET QT_QPA_PLATFORM PATH; do
+            if [[ -n "${!v:-}" ]]; then
+                env_args+=(--setenv="$v=${!v}")
+            fi
+        done
+        if systemd-run --user --collect --slice=app.slice "${env_args[@]}" \
+            env -u SERPANTINUM_DIR -u QS_DIR -u MAIN_QML "$bin" start </dev/null >/dev/null 2>&1; then
+            started=1
+        fi
+    fi
+
+    if [[ "$started" -ne 1 ]]; then
+        if command -v setsid >/dev/null 2>&1; then
+            setsid env -u SERPANTINUM_DIR -u QS_DIR -u MAIN_QML "$bin" start </dev/null >/dev/null 2>&1 9>&- 8>&- &
+        else
+            nohup env -u SERPANTINUM_DIR -u QS_DIR -u MAIN_QML "$bin" start </dev/null >/dev/null 2>&1 9>&- 8>&- &
+        fi
+        local d_pid=$!
+        disown "$d_pid" 2>/dev/null || true
+    fi
 
     local i
     for i in {1..10}; do
@@ -2988,6 +3018,9 @@ auto_adopt_session_env() {
     if [[ -z "$pid" ]]; then
         pid="$(pgrep -f "bin/serpantinumd" 2>/dev/null | head -n1 || true)"
     fi
+    if [[ -z "$pid" ]]; then
+        pid="$(pgrep -x niri 2>/dev/null || pgrep -x Hyprland 2>/dev/null || pgrep -x sway 2>/dev/null | head -n1 || true)"
+    fi
 
     if [[ -z "$pid" || ! -r "/proc/$pid/environ" ]]; then
         return 1
@@ -3462,6 +3495,7 @@ Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
 Nice=15
 IOSchedulingClass=idle
 TimeoutStartSec=infinity
+KillMode=process
 EOF_SVC
 
     cat > "$AUTO_UNIT_DIR/linka-auto.timer" <<EOF_TMR

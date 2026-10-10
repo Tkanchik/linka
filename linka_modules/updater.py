@@ -97,11 +97,22 @@ def restart_shell_if_running():
         log_info("Перезапуск Quickshell...")
         run_cmd(["serpantinumd", "stop"])
         time.sleep(1)
-        import subprocess
-        subprocess.Popen(
-            ["serpantinumd", "start"],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            stdin=subprocess.DEVNULL,
-            start_new_session=True,
-        )
+        if shutil.which("systemd-run") and run_cmd(["systemctl", "--user", "list-units"], capture=True)[0] == 0:
+            env_vars = ["WAYLAND_DISPLAY", "DISPLAY", "XDG_RUNTIME_DIR", "XDG_CURRENT_DESKTOP", "XDG_SESSION_TYPE", "PATH"]
+            cmd = ["systemd-run", "--user", "--collect", "--slice=app.slice"]
+            import os
+            for var in env_vars:
+                val = os.environ.get(var)
+                if val:
+                    cmd.append(f"--setenv={var}={val}")
+            cmd.extend(["serpantinumd", "start"])
+            run_cmd(cmd)
+        else:
+            import subprocess
+            subprocess.Popen(
+                ["serpantinumd", "start"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                stdin=subprocess.DEVNULL,
+                start_new_session=True,
+            )
