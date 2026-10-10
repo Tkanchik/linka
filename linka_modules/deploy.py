@@ -128,7 +128,9 @@ def deploy_sddm_theme(repo_dir: Path, enable: bool = False):
     if not enable:
         return
 
-    sddm_src = repo_dir / "src/assets/sddm/material-you"
+    sddm_src = repo_dir / "config/sddm/themes/material-you"
+    if not sddm_src.exists():
+        sddm_src = repo_dir / "src/assets/sddm/material-you"
     sddm_target = Path("/usr/share/sddm/themes/material-you")
 
     if sddm_src.exists():

@@ -90,8 +90,18 @@ def perform_update(force: bool = False, branch: str = DEFAULT_BRANCH) -> bool:
 
 def restart_shell_if_running():
     """Перезапуск Quickshell, если он запущен."""
-    ret, out, _ = run_cmd(["pgrep", "-x", "quickshell"], capture=True)
+    ret, out, _ = run_cmd(["pgrep", "-f", "quickshell"], capture=True)
+    if ret != 0:
+        ret, out, _ = run_cmd(["pgrep", "-f", "bin/serpantinumd"], capture=True)
     if ret == 0:
         log_info("Перезапуск Quickshell...")
-        run_cmd(["pkill", "-TERM", "-x", "quickshell"])
-        run_cmd(["serpantinumd", "start"])
+        run_cmd(["serpantinumd", "stop"])
+        time.sleep(1)
+        import subprocess
+        subprocess.Popen(
+            ["serpantinumd", "start"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            stdin=subprocess.DEVNULL,
+            start_new_session=True,
+        )

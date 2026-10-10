@@ -11,6 +11,8 @@ COMPOSITOR_DIRS = {
 def deploy_compositor(repo_dir: Path, compositor: str = "niri", overwrite: bool = False) -> bool:
     """Развёртывание конфигурации выбранного композитора."""
     src = repo_dir / "compositors" / compositor
+    if not src.exists() and (repo_dir / "compositor" / compositor).exists():
+        src = repo_dir / "compositor" / compositor
     dst = COMPOSITOR_DIRS.get(compositor)
 
     if not src.exists():

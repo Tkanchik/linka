@@ -25,7 +25,8 @@ if [ ! -d "${SHARE_DIR}/.git" ]; then
     rm -rf "${SHARE_DIR}"
     git clone "${REPO_URL}" "${SHARE_DIR}"
 else
-    git -C "${SHARE_DIR}" pull --ff-only 2>/dev/null || true
+    git -C "${SHARE_DIR}" fetch origin 2>/dev/null || true
+    git -C "${SHARE_DIR}" reset --hard origin/main 2>/dev/null || git -C "${SHARE_DIR}" pull --ff-only 2>/dev/null || true
 fi
 
 chmod +x "${SHARE_DIR}/linka"
@@ -42,4 +43,4 @@ if [ ! -t 0 ] && [ -e /dev/tty ]; then
     exec < /dev/tty
 fi
 
-exec "${LINKA_SYMLINK}" "${@:-}"
+exec "${LINKA_SYMLINK}" "$@"
