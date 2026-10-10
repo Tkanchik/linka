@@ -700,6 +700,18 @@ shell_running() {
         return 0
     fi
 
+    if pgrep -f "bin/serpantinumd" >/dev/null 2>&1; then
+        return 0
+    fi
+
+    if [[ -f "/tmp/serpantinumd.pid" ]]; then
+        local p
+        p="$(cat /tmp/serpantinumd.pid 2>/dev/null || true)"
+        if [[ -n "$p" ]] && kill -0 "$p" 2>/dev/null; then
+            return 0
+        fi
+    fi
+
     return 1
 }
 
@@ -728,6 +740,7 @@ stop_shell() {
 
     pkill -f "$TARGET_BASE/src/quickshell" 2>/dev/null || true
     pkill -x serpantinumd 2>/dev/null || true
+    pkill -f "bin/serpantinumd" 2>/dev/null || true
 
     for i in 1 2 3; do
         if ! shell_running; then
@@ -740,6 +753,7 @@ stop_shell() {
     # pkill quickshell не используется: он убил бы чужие инстансы пользователя.
     pkill -9 -f "$TARGET_BASE/src/quickshell" 2>/dev/null || true
     pkill -9 -x serpantinumd 2>/dev/null || true
+    pkill -9 -f "bin/serpantinumd" 2>/dev/null || true
 
     for i in 1 2 3; do
         if ! shell_running; then
@@ -764,9 +778,11 @@ start_shell() {
     fi
 
     # serpantinumd start ждёт завершения quickshell (wait $QS_PID).
-    # Запускаем в фоне с отрывом дескрипторов (nohup / 9>&- 8>&- &), чтобы
+    # Запускаем в фоне с отрывом дескрипторов (nohup env ... / 9>&- 8>&- &), чтобы
     # вызывающий процесс (в т.ч. автообновление) не зависал с блокировкой.
-    nohup run_serpantinumd "$bin" start </dev/null >/dev/null 2>&1 &
+    # Вызываем напрямую утилиту env, так как внешний бинарник nohup не может
+    # вызвать функцию bash (run_serpantinumd).
+    nohup env -u SERPANTINUM_DIR -u QS_DIR -u MAIN_QML "$bin" start </dev/null >/dev/null 2>&1 9>&- 8>&- &
     local d_pid=$!
     disown "$d_pid" 2>/dev/null || true
 
@@ -779,7 +795,7 @@ start_shell() {
     done
 
     log_warn "serpantinumd запущен, но статус shell пока не подтверждён ($bin)"
-    return 0
+    return 1
 }
 
 kill_serpantinum() {
@@ -789,6 +805,7 @@ kill_serpantinum() {
 
     pkill -9 -f "$TARGET_BASE/src/quickshell" 2>/dev/null || true
     pkill -9 -x serpantinumd 2>/dev/null || true
+    pkill -9 -f "bin/serpantinumd" 2>/dev/null || true
 
     sleep 1
 
@@ -2939,7 +2956,7 @@ auto_adopt_session_env() {
 
     pid="$(pgrep -f "$TARGET_BASE/src/quickshell" 2>/dev/null | head -n1 || true)"
     if [[ -z "$pid" ]]; then
-        pid="$(pgrep -x serpantinumd 2>/dev/null | head -n1 || true)"
+        pid="$(pgrep -f "bin/serpantinumd" 2>/dev/null | head -n1 || true)"
     fi
 
     if [[ -z "$pid" || ! -r "/proc/$pid/environ" ]]; then
