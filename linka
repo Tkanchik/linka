@@ -377,7 +377,7 @@ state_get() {
         return 0
     fi
 
-    awk -F= -v k="$1" '$1==k{sub(/^[^=]*=/,""); print; exit}' "$STATE_FILE"
+    K="$1" awk -F= 'BEGIN{k=ENVIRON["K"]} $1==k{sub(/^[^=]*=/,""); print; exit}' "$STATE_FILE"
     return 0
 }
 
@@ -391,8 +391,8 @@ update_state_field() {
     tmp="$(mktemp "${STATE_DIR}/.state.XXXXXX")"
 
     if [[ -f "$STATE_FILE" ]]; then
-        awk -F= -v k="$key" -v v="$safe_value" '
-            BEGIN{f=0}
+        K="$key" V="$safe_value" awk -F= '
+            BEGIN{f=0; k=ENVIRON["K"]; v=ENVIRON["V"]}
             $1==k{print k"="v; f=1; next}
             {print}
             END{if(!f) print k"="v}
@@ -576,8 +576,9 @@ detect_install_state() {
 # ---------- repo ----------
 protect_local_repo_changes() {
     # Перед git reset --hard сохраняем локальные правки, а не теряем их.
-    local ts msg
-    if [[ -z "$(git -C "$CACHE_BASE" status --porcelain 2>/dev/null || true)" ]]; then
+    local ts msg status_out
+    status_out="$(git -C "$CACHE_BASE" status --porcelain 2>/dev/null || true)"
+    if [[ -z "$status_out" ]]; then
         return 0
     fi
 
@@ -590,14 +591,20 @@ protect_local_repo_changes() {
         return 0
     fi
 
-    mkdir -p "$BACKUP_BASE"
-    if git -C "$CACHE_BASE" diff HEAD > "$BACKUP_BASE/repo-local-changes.${ts}.patch" 2>/dev/null; then
-        log_warn "В $CACHE_BASE были локальные изменения — diff сохранён в $BACKUP_BASE/repo-local-changes.${ts}.patch"
-    else
-        log_warn "В $CACHE_BASE есть локальные изменения, сохранить их не удалось"
+    # Если stash не сработал: diff HEAD не включает неотслеживаемые файлы
+    if echo "$status_out" | grep -q '^\?\?'; then
+        log_error "В $CACHE_BASE есть неотслеживаемые файлы, но git stash не сработал. Сброс репозитория отменён во избежание потери данных."
+        return 1
     fi
 
-    return 0
+    mkdir -p "$BACKUP_BASE"
+    if git -C "$CACHE_BASE" diff HEAD > "$BACKUP_BASE/repo-local-changes.${ts}.patch" 2>/dev/null && [[ -s "$BACKUP_BASE/repo-local-changes.${ts}.patch" ]]; then
+        log_warn "В $CACHE_BASE были локальные изменения — diff сохранён в $BACKUP_BASE/repo-local-changes.${ts}.patch"
+        return 0
+    else
+        log_error "В $CACHE_BASE есть локальные изменения, но сохранить их не удалось. Сброс репозитория отменён."
+        return 1
+    fi
 }
 
 ensure_repo() {
@@ -641,7 +648,7 @@ ensure_repo() {
         return 1
     fi
 
-    protect_local_repo_changes
+    protect_local_repo_changes || return 1
     git -C "$CACHE_BASE" reset --hard "$ref" || return 1
 
     ACTIVE_REPO_BRANCH="${ref#origin/}"
@@ -744,7 +751,8 @@ stop_shell() {
 
     pkill -f "$TARGET_BASE/src/quickshell" 2>/dev/null || true
     pkill -x serpantinumd 2>/dev/null || true
-    pkill -f "bin/serpantinumd" 2>/dev/null || true
+    pkill -f "$TARGET_BASE/bin/serpantinumd" 2>/dev/null || true
+    pkill -f "$BIN_DIR/serpantinumd" 2>/dev/null || true
 
     for i in 1 2 3; do
         if ! shell_running; then
@@ -758,7 +766,8 @@ stop_shell() {
     # pkill quickshell не используется: он убил бы чужие инстансы пользователя.
     pkill -9 -f "$TARGET_BASE/src/quickshell" 2>/dev/null || true
     pkill -9 -x serpantinumd 2>/dev/null || true
-    pkill -9 -f "bin/serpantinumd" 2>/dev/null || true
+    pkill -9 -f "$TARGET_BASE/bin/serpantinumd" 2>/dev/null || true
+    pkill -9 -f "$BIN_DIR/serpantinumd" 2>/dev/null || true
 
     for i in 1 2 3; do
         if ! shell_running; then
@@ -838,7 +847,8 @@ kill_serpantinum() {
 
     pkill -9 -f "$TARGET_BASE/src/quickshell" 2>/dev/null || true
     pkill -9 -x serpantinumd 2>/dev/null || true
-    pkill -9 -f "bin/serpantinumd" 2>/dev/null || true
+    pkill -9 -f "$TARGET_BASE/bin/serpantinumd" 2>/dev/null || true
+    pkill -9 -f "$BIN_DIR/serpantinumd" 2>/dev/null || true
 
     sleep 1
 
@@ -877,37 +887,91 @@ bootstrap_installer_deps() {
     return 0
 }
 
+is_sddm_theme_managed() {
+    [[ ! -e "$SDDM_THEME_DIR" ]] && return 0
+    [[ -f "$SDDM_THEME_DIR/.linka-managed" ]] && return 0
+    [[ -f "$SDDM_MANAGED_CONF" ]] && return 0
+    return 1
+}
+
+is_font_system_managed() {
+    [[ ! -e "$FONT_SYSTEM_DIR" ]] && return 0
+    [[ -f "$FONT_SYSTEM_DIR/.linka-managed" ]] && return 0
+
+    local sys_files=("$FONT_SYSTEM_DIR"/*.ttf)
+    if [[ ! -e "${sys_files[0]}" ]]; then
+        return 1
+    fi
+    local f base
+    for f in "${sys_files[@]}"; do
+        base="$(basename "$f")"
+        if [[ ! -f "$USER_FONT_DIR/$base" ]]; then
+            return 1
+        fi
+    done
+    return 0
+}
+
 install_fonts() {
     local target="$USER_FONT_DIR"
     local cache zip
     cache="${XDG_CACHE_HOME:-$HOME/.cache}/serpantinum-fonts"
     zip="$cache/Iosevka.zip"
 
-    mkdir -p "$cache" "$target"
+    mkdir -p "$target"
 
     if ! compgen -G "$target/*.ttf" >/dev/null 2>&1; then
         if command -v curl >/dev/null 2>&1 && command -v unzip >/dev/null 2>&1; then
             log_info 'Шрифты Iosevka (может занять минуту на слабом канале)...'
+            mkdir -p "$cache"
 
-            if curl -fL --connect-timeout 15 --retry 3 "$FONT_URL" -o "$zip" &&
-               unzip -qo "$zip" -d "$cache/x"; then
-                find "$cache/x" -type f -iname '*.ttf' ! -iname '*Mono*.ttf' -exec cp -f {} "$target/" \;
+            if curl -fL --connect-timeout 15 --retry 3 "$FONT_URL" -o "$zip"; then
+                local sha_file="$cache/SHA-256.txt"
+                local expected_sha actual_sha
+                if curl -fsSL --connect-timeout 10 "https://github.com/ryanoasis/nerd-fonts/releases/latest/download/SHA-256.txt" -o "$sha_file" 2>/dev/null; then
+                    expected_sha="$(grep -i 'Iosevka.zip$' "$sha_file" 2>/dev/null | awk '{print $1}' | head -n1)"
+                    if [[ -n "$expected_sha" ]] && command -v sha256sum >/dev/null 2>&1; then
+                        actual_sha="$(sha256sum "$zip" | awk '{print $1}')"
+                        if [[ "$expected_sha" != "$actual_sha" ]]; then
+                            log_error "Контрольная сумма шрифтов не совпадает (ожидалась: $expected_sha, получена: $actual_sha). Загрузка отменена."
+                            rm -rf "$cache"
+                            return 1
+                        fi
+                        log_info "Контрольная сумма Iosevka.zip проверена ($expected_sha)."
+                    fi
+                else
+                    log_warn 'Не удалось скачать контрольные суммы SHA-256.txt, продолжаю без сверки хеша.'
+                fi
+
+                if unzip -qo "$zip" -d "$cache/x"; then
+                    find "$cache/x" -type f -iname '*.ttf' ! -iname '*Mono*.ttf' -exec cp -f {} "$target/" \;
+                    touch "$target/.linka-managed" 2>/dev/null || true
+                else
+                    log_warn 'Шрифты: не удалось распаковать'
+                fi
             else
-                log_warn 'Шрифты: не удалось скачать/распаковать'
+                log_warn 'Шрифты: не удалось скачать'
             fi
         else
             log_warn 'Шрифты: нет curl/unzip, пропускаю загрузку'
         fi
 
         rm -rf "$cache"
+    else
+        touch "$target/.linka-managed" 2>/dev/null || true
     fi
 
     fc-cache -f "$HOME/.local/share/fonts" >/dev/null 2>&1 || true
 
     if compgen -G "$target/*.ttf" >/dev/null 2>&1; then
-        run_optional_root mkdir -p "$FONT_SYSTEM_DIR" || true
-        run_optional_root cp -f "$target"/*.ttf "$FONT_SYSTEM_DIR/" || true
-        run_optional_root fc-cache -f /usr/share/fonts >/dev/null 2>&1 || true
+        if [[ -d "$FONT_SYSTEM_DIR" ]] && ! is_font_system_managed; then
+            log_warn "Каталог системных шрифтов $FONT_SYSTEM_DIR не управляется linka. Пропускаю установку системных шрифтов."
+        else
+            run_optional_root mkdir -p "$FONT_SYSTEM_DIR" || true
+            run_optional_root cp -f "$target"/*.ttf "$FONT_SYSTEM_DIR/" || true
+            run_optional_root touch "$FONT_SYSTEM_DIR/.linka-managed" 2>/dev/null || true
+            run_optional_root fc-cache -f /usr/share/fonts >/dev/null 2>&1 || true
+        fi
     fi
 
     return 0
@@ -923,7 +987,13 @@ gentoo_ensure_guru() {
     log_info 'Gentoo: подключаю overlay guru (зеркало)...'
 
     if [[ -e /var/db/repos/guru ]]; then
-        run_root rm -rf /var/db/repos/guru || true
+        local guru_bak="/var/db/repos/guru.linka-bak.$(date +%Y%m%d_%H%M%S)"
+        if run_root mv /var/db/repos/guru "$guru_bak" 2>/dev/null; then
+            log_warn "Каталог /var/db/repos/guru не содержал валидного профиля оверлея и перемещён в $guru_bak"
+        else
+            log_warn "Не удалось забэкапить невалидный /var/db/repos/guru — пропускаю подключение оверлея."
+            return 0
+        fi
     fi
 
     run_root mkdir -p /var/db/repos /etc/portage/repos.conf || true
@@ -1014,6 +1084,37 @@ gentoo_filter_atoms() {
     return 0
 }
 
+gentoo_apply_autounmask_cfg() {
+    local cfg_file target_file dir base name
+    # 1. Каталоги /etc/portage/package.* (package.use, package.accept_keywords, package.mask, package.unmask, package.license, package.env)
+    for dir in /etc/portage/package.*; do
+        if [[ -d "$dir" ]]; then
+            while IFS= read -r cfg_file; do
+                [[ -z "$cfg_file" ]] && continue
+                base="$(basename "$cfg_file")"
+                if [[ "$base" =~ ^\._cfg[0-9]+_(.+)$ ]]; then
+                    name="${BASH_REMATCH[1]}"
+                    target_file="$dir/$name"
+                    run_root mv -f "$cfg_file" "$target_file" || true
+                fi
+            done < <(find "$dir" -maxdepth 1 -name '._cfg[0-9]*_*' 2>/dev/null | sort -V)
+        fi
+    done
+
+    # 2. Плоские файлы в /etc/portage/._cfgNNNN_package.*
+    while IFS= read -r cfg_file; do
+        [[ -z "$cfg_file" ]] && continue
+        base="$(basename "$cfg_file")"
+        if [[ "$base" =~ ^\._cfg[0-9]+_(package\..+)$ ]]; then
+            name="${BASH_REMATCH[1]}"
+            target_file="/etc/portage/$name"
+            run_root mv -f "$cfg_file" "$target_file" || true
+        fi
+    done < <(find /etc/portage -maxdepth 1 -name '._cfg[0-9]*_package.*' 2>/dev/null | sort -V)
+
+    return 0
+}
+
 gentoo_autounmask_resolve() {
     local round_i
 
@@ -1028,13 +1129,10 @@ gentoo_autounmask_resolve() {
 
         log_info "Gentoo: autounmask (круг $round_i)..."
 
-        # --autounmask-write кладёт изменения в ._cfg0000_* файлы;
-        # без etc-update они не применяются и цикл был бы бесполезен.
+        # --autounmask-write кладёт изменения в ._cfg0000_* файлы в /etc/portage;
+        # применяем только файлы для package.*, не затрагивая остальную систему.
         run_root emerge --pretend --autounmask=y --autounmask-write=y "$@" >/dev/null 2>&1 || true
-
-        if command -v etc-update >/dev/null 2>&1; then
-            run_root etc-update --automode -5 >/dev/null 2>&1 || true
-        fi
+        gentoo_apply_autounmask_cfg
     done
 
     if emerge --pretend "$@" >/dev/null 2>&1; then
@@ -1386,16 +1484,19 @@ backup_user_config() {
 
     if [[ -z "$CONFIG_BACKUP_DIR" ]]; then
         CONFIG_BACKUP_DIR="$BACKUP_BASE/configs.$(date +%Y%m%d_%H%M%S)"
-        mkdir -p "$CONFIG_BACKUP_DIR" || return 0
+        if ! mkdir -p "$CONFIG_BACKUP_DIR"; then
+            log_warn "Не удалось создать каталог бэкапов $CONFIG_BACKUP_DIR"
+            return 1
+        fi
     fi
 
     if cp -a "$path" "$CONFIG_BACKUP_DIR/" 2>/dev/null; then
         log_info "Бэкап ~/.config/$name → $CONFIG_BACKUP_DIR/"
+        return 0
     else
         log_warn "Не удалось сделать бэкап ~/.config/$name"
+        return 1
     fi
-
-    return 0
 }
 
 deploy_compositor_config() {
@@ -1419,7 +1520,10 @@ deploy_compositor_config() {
     fi
 
     tgt="$HOME/.config/$dn"
-    backup_user_config "$dn"
+    if ! backup_user_config "$dn"; then
+        log_warn "Пропускаю развёртывание конфига $c в ~/.config/$dn, так как бэкап не удался."
+        return 0
+    fi
     mkdir -p "$tgt"
     cp -a "$src/." "$tgt/"
     log_ok "Конфиг $c развёрнут в ~/.config/$dn"
@@ -1627,8 +1731,8 @@ deploy_full() {
             backup_dir="${BACKUP_BASE}/target.$(date +%Y%m%d_%H%M%S)"
 
             if ! mv "$TARGET_BASE" "$backup_dir"; then
-                log_warn "Не удалось переместить старый $TARGET_BASE в $backup_dir, пробую rm -rf"
-                rm -rf "$TARGET_BASE" || return 1
+                log_error "Не удалось переместить старый $TARGET_BASE в $backup_dir: переустановка прервана, ничего не удалено."
+                return 1
             fi
         fi
 
@@ -1675,7 +1779,10 @@ deploy_full() {
             tgt="$HOME/.config/$c"
 
             if [[ -e "$src" ]]; then
-                backup_user_config "$c"
+                if ! backup_user_config "$c"; then
+                    log_warn "Пропускаю обновление конфига $c в ~/.config/$c, так как бэкап не удался."
+                    continue
+                fi
                 mkdir -p "$(dirname "$tgt")"
 
                 if [[ -d "$src" ]]; then
@@ -1894,19 +2001,23 @@ setup_sddm() {
         return 0
     fi
 
-    if ! run_root mkdir -p /etc/sddm.conf.d "$SDDM_THEME_DIR"; then
-        log_warn 'SDDM: не удалось создать каталоги'
-        return 0
-    fi
+    if [[ -d "$SDDM_THEME_DIR" ]] && ! is_sddm_theme_managed; then
+        log_warn "Каталог темы SDDM $SDDM_THEME_DIR уже существует и не управляется linka (нет метки .linka-managed). Пропускаю установку темы SDDM."
+    else
+        if ! run_root mkdir -p /etc/sddm.conf.d "$SDDM_THEME_DIR"; then
+            log_warn 'SDDM: не удалось создать каталоги'
+            return 0
+        fi
 
-    if ! run_root cp -a "$src/." "$SDDM_THEME_DIR/"; then
-        log_warn 'SDDM: не удалось скопировать тему'
-        return 0
-    fi
+        if ! run_root cp -a "$src/." "$SDDM_THEME_DIR/"; then
+            log_warn 'SDDM: не удалось скопировать тему'
+            return 0
+        fi
 
-    run_root chmod -R a+rX "$SDDM_THEME_DIR" || true
+        run_root touch "$SDDM_THEME_DIR/.linka-managed" 2>/dev/null || true
+        run_root chmod -R a+rX "$SDDM_THEME_DIR" || true
 
-    if ! run_root tee "$SDDM_MANAGED_CONF" >/dev/null <<'EOF_SDDM'
+        if ! run_root tee "$SDDM_MANAGED_CONF" >/dev/null <<'EOF_SDDM'
 [Theme]
 Current=material-you
 ThemeDir=/usr/share/sddm/themes
@@ -1914,9 +2025,10 @@ ThemeDir=/usr/share/sddm/themes
 [General]
 InputMethod=
 EOF_SDDM
-    then
-        log_warn 'SDDM: не удалось записать конфиг'
-        return 0
+        then
+            log_warn 'SDDM: не удалось записать конфиг'
+            return 0
+        fi
     fi
 
     if [[ "$(detect_init_system)" == systemd ]]; then
@@ -2636,6 +2748,28 @@ run_installer_ui() {
 
 
 # ---------- workflows ----------
+run_user_post_update_hook() {
+    local user_hook="$CONFIG_DIR/hooks/post_update.sh"
+    if [[ ! -e "$user_hook" ]]; then
+        return 0
+    fi
+    if [[ ! -x "$user_hook" ]]; then
+        log_warn "Пользовательский хук $user_hook найден, но не имеет прав на выполнение (chmod +x)."
+        return 0
+    fi
+
+    log_info "Выполняю пользовательский хук: $user_hook"
+    (
+        export TARGET_DIR="${TARGET_DIR:-$TARGET_BASE/src}"
+        export TARGET_BASE="$TARGET_BASE"
+        export CONFIG_DIR="$CONFIG_DIR"
+        exec 9>&- 8>&-
+        "$user_hook"
+    ) || log_warn "Пользовательский хук завершился с ошибкой ($?)"
+
+    return 0
+}
+
 flow_install() {
     local requested="$1"
     local sel
@@ -2713,14 +2847,8 @@ flow_install() {
     mark_shell_state || true
     write_version_file || true
 
+    run_user_post_update_hook || true
 
-
-    # Вызов пользовательского post-update хука (восстановление кастомных виджетов)
-    local user_hook="$CONFIG_DIR/hooks/post_update.sh"
-    if [[ -x "$user_hook" ]]; then
-        log_info "Выполняю пользовательский хук: $user_hook"
-        "$user_hook" || log_warn "Пользовательский хук завершился с ошибкой"
-    fi
     if start_shell; then
         log_ok "Serpantinum $TARGET_VERSION ($TARGET_COMMIT) запущен."
     else
@@ -2827,6 +2955,8 @@ flow_update() {
         setup_services || true
     fi
 
+    run_user_post_update_hook || true
+
     if start_shell_unless_idle "$shell_was_running"; then
         log_ok "Обновлён: $TARGET_VERSION ($TARGET_COMMIT)."
     else
@@ -2840,6 +2970,7 @@ flow_update() {
 
 emergency_remove() {
     local c sddm_ours='' rb
+    local sddm_theme_managed=false font_sys_managed=false
 
     clear 2>/dev/null || true
     printf '%sУДАЛЕНИЕ SERPANTINUM%s\n' "$BOLD" "$RESET"
@@ -2856,15 +2987,25 @@ emergency_remove() {
     # Читаем ДО удаления state-файла.
     sddm_ours="$(state_get SDDM_ENABLED_BY_LINKA || true)"
 
+    # Проверяем владение системными каталогами ДО удаления SDDM_MANAGED_CONF
+    if is_sddm_theme_managed; then
+        sddm_theme_managed=true
+    fi
+    if is_font_system_managed; then
+        font_sys_managed=true
+    fi
+
     # Настройки пользователя — единственное, что нельзя восстановить
     # переустановкой, поэтому перед удалением кладём копию в бэкапы.
+    # Если бэкап не удался — прерываем операцию, ничего не удаляя.
     if [[ -d "$CONFIG_DIR" && -n "$(ls -A "$CONFIG_DIR" 2>/dev/null || true)" ]]; then
         rb="$BACKUP_BASE/removed.$(date +%Y%m%d_%H%M%S)"
-        if mkdir -p "$rb" && cp -a "$CONFIG_DIR/." "$rb/" 2>/dev/null; then
-            log_info "Настройки сохранены: $rb"
-        else
-            log_warn "Не удалось сохранить настройки в $rb"
+        if ! mkdir -p "$rb" || ! cp -a "$CONFIG_DIR/." "$rb/" 2>/dev/null; then
+            log_error "Не удалось сохранить настройки в $rb. Удаление отменено, файлы не затронуты."
+            end_session
+            return 1
         fi
+        log_info "Настройки сохранены: $rb"
     fi
 
     kill_serpantinum || true
@@ -2885,11 +3026,19 @@ emergency_remove() {
     fi
 
     if [[ -d "$SDDM_THEME_DIR" ]]; then
-        run_optional_root rm -rf "$SDDM_THEME_DIR" || true
+        if [[ "$sddm_theme_managed" == true ]]; then
+            run_optional_root rm -rf "$SDDM_THEME_DIR" || true
+        else
+            log_warn "Каталог темы SDDM $SDDM_THEME_DIR не принадлежит linka — оставляю нетронутым. Для ручного удаления: sudo rm -rf '$SDDM_THEME_DIR'"
+        fi
     fi
 
     if [[ -d "$FONT_SYSTEM_DIR" ]]; then
-        run_optional_root rm -rf "$FONT_SYSTEM_DIR" || true
+        if [[ "$font_sys_managed" == true ]]; then
+            run_optional_root rm -rf "$FONT_SYSTEM_DIR" || true
+        else
+            log_warn "Каталог системных шрифтов $FONT_SYSTEM_DIR не принадлежит linka — оставляю нетронутым. Для ручного удаления: sudo rm -rf '$FONT_SYSTEM_DIR'"
+        fi
     fi
 
     if [[ -d "$USER_FONT_DIR" ]]; then
@@ -2909,6 +3058,7 @@ emergency_remove() {
     rm -f "$STATE_FILE" "$STATE_DIR/version" "$STATE_DIR/.last-update-backup" 2>/dev/null || true
     rm -rf "$STATE_DIR/sounds" 2>/dev/null || true
 
+    end_session
     log_ok 'Serpantinum удалён.'
     return 0
 }
@@ -2923,7 +3073,7 @@ emergency_remove() {
 auto_get() {
     local v=""
     if [[ -f "$AUTO_CONF" ]]; then
-        v="$(awk -F= -v k="$1" '$1==k{sub(/^[^=]*=/,""); print; exit}' "$AUTO_CONF" 2>/dev/null || true)"
+        v="$(K="$1" awk -F= 'BEGIN{k=ENVIRON["K"]} $1==k{sub(/^[^=]*=/,""); print; exit}' "$AUTO_CONF" 2>/dev/null || true)"
     fi
     printf '%s\n' "${v:-${2:-}}"
     return 0
@@ -2936,8 +3086,8 @@ auto_set() {
     tmp="$(mktemp "$STATE_DIR/.auto.XXXXXX")"
 
     if [[ -f "$AUTO_CONF" ]]; then
-        awk -F= -v k="$key" -v v="$val" '
-            BEGIN{f=0}
+        K="$key" V="$val" awk -F= '
+            BEGIN{f=0; k=ENVIRON["K"]; v=ENVIRON["V"]}
             $1==k{print k"="v; f=1; next}
             {print}
             END{if(!f) print k"="v}
@@ -3016,10 +3166,10 @@ auto_adopt_session_env() {
 
     pid="$(pgrep -f "$TARGET_BASE/src/quickshell" 2>/dev/null | head -n1 || true)"
     if [[ -z "$pid" ]]; then
-        pid="$(pgrep -f "bin/serpantinumd" 2>/dev/null | head -n1 || true)"
+        pid="$({ pgrep -f "$TARGET_BASE/bin/serpantinumd" || pgrep -f "$BIN_DIR/serpantinumd"; } 2>/dev/null | head -n1 || true)"
     fi
     if [[ -z "$pid" ]]; then
-        pid="$(pgrep -x niri 2>/dev/null || pgrep -x Hyprland 2>/dev/null || pgrep -x sway 2>/dev/null | head -n1 || true)"
+        pid="$({ pgrep -x niri || pgrep -x Hyprland || pgrep -x sway; } 2>/dev/null | head -n1 || true)"
     fi
 
     if [[ -z "$pid" || ! -r "/proc/$pid/environ" ]]; then
@@ -3736,6 +3886,7 @@ auto_enable() {
     if [[ "$need_sudo" == true ]]; then
         start_sudo_keepalive
         if ! auto_install_sudoers "$sys_mode"; then
+            run_optional_root rm -f "$AUTO_SUDOERS_FILE" || true
             log_warn 'Обновление системы отключено (не удалось настроить sudo). Остальное включится.'
             sys_mode=off
         fi
@@ -3797,7 +3948,7 @@ auto_disable() {
     auto_daemon_stop
     rm -f "$AUTO_AUTOSTART_FILE"
 
-    if [[ "$prev_sys" != off && -f "$AUTO_SUDOERS_FILE" ]]; then
+    if [[ "$prev_sys" != off ]]; then
         start_sudo_keepalive
         run_optional_root rm -f "$AUTO_SUDOERS_FILE" || true
     fi
@@ -4036,8 +4187,10 @@ linka_main_menu() {
                     fi
                     ;;
                 "8")
-                    cleanup_terminal
-                    return 0
+                    if [[ "$INSTALL_STATE" == "current" ]]; then
+                        cleanup_terminal
+                        return 0
+                    fi
                     ;;
                 ENTER|SPACE)
                     case "$cursor" in
@@ -4107,9 +4260,12 @@ linka_main_menu() {
                     ;;
                 [sS]|kill)
                     cleanup_terminal
-                    kill_serpantinum || true
-                    end_session
-                    read -r -p 'Нажмите Enter для продолжения...' _ || true
+                    read -r -p 'Остановить Quickshell? [y/N] ' confirm_stop || true
+                    if [[ "$confirm_stop" =~ ^[Yy]$ ]]; then
+                        kill_serpantinum || true
+                        end_session
+                        read -r -p 'Нажмите Enter для продолжения...' _ || true
+                    fi
                     stty -echo icanon 2>/dev/null || true
                     printf "\e[?25l" 2>/dev/null || true
                     break
@@ -4165,9 +4321,11 @@ main() {
     esac
 }
 
-case "${1:-}" in
-    -h|--help) ;;
-    *) preflight ;;
-esac
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    case "${1:-}" in
+        -h|--help) ;;
+        *) preflight ;;
+    esac
 
-main "$@"
+    main "$@"
+fi
