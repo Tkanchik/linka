@@ -342,8 +342,9 @@ pkg_installed() {
 }
 
 comp_atom() {
+    local c="${1,,}"
     if [[ "$DISTRO" == 'fedora' ]]; then
-        case "$1" in
+        case "$c" in
             hyprland) printf 'hyprland\n' ;;
             niri)     printf 'niri\n' ;;
             sway)     printf 'sway\n' ;;
@@ -352,13 +353,37 @@ comp_atom() {
         return 0
     fi
 
-    case "$1" in
+    case "$c" in
         hyprland) printf 'gui-wm/hyprland\n' ;;
         niri)     printf 'gui-wm/niri\n' ;;
         sway)     printf 'gui-wm/sway\n' ;;
         *)        printf '%s\n' "$1" ;;
     esac
 }
+
+is_compositor_installed() {
+    local comp="${1,,}"
+    case "$comp" in
+        hyprland)
+            command -v hyprland >/dev/null 2>&1 ||
+            command -v Hyprland >/dev/null 2>&1 ||
+            pkg_installed "$(comp_atom hyprland)" 2>/dev/null
+            ;;
+        niri)
+            command -v niri >/dev/null 2>&1 ||
+            pkg_installed "$(comp_atom niri)" 2>/dev/null
+            ;;
+        sway)
+            command -v sway >/dev/null 2>&1 ||
+            pkg_installed "$(comp_atom sway)" 2>/dev/null
+            ;;
+        *)
+            command -v "$comp" >/dev/null 2>&1 ||
+            pkg_installed "$(comp_atom "$comp")" 2>/dev/null
+            ;;
+    esac
+}
+
 
 # ---------- state ----------
 serialize_array() {
@@ -1205,7 +1230,7 @@ check_quickshell() {
 install_dependencies() {
     local compositors=("$@")
     local target_list=()
-    local comp pkg
+    local comp pkg c
 
     FAILED_PKGS=()
 
@@ -1247,10 +1272,34 @@ install_dependencies() {
 
         if [[ ${#compositors[@]} -gt 0 ]]; then
             for comp in "${compositors[@]}"; do
-                pkg="$(comp_atom "$comp")"
-                if ! pkg_installed "$pkg"; then
-                    run_root dnf install -y "$pkg" ||
-                        log_warn "compositor: $pkg не установлен (для hyprland проверьте COPR, например solopasha/hyprland)"
+                c="${comp,,}"
+                pkg="$(comp_atom "$c")"
+                if ! is_compositor_installed "$c"; then
+                    if [[ "$c" == hyprland ]]; then
+                        if fedora_ensure_copr_plugin; then
+                            log_info 'Fedora: подключаю COPR solopasha/hyprland...'
+                            run_root dnf copr enable -y solopasha/hyprland ||
+                                log_warn 'COPR solopasha/hyprland не включился — hyprland может не установиться'
+                        else
+                            log_warn 'Плагин dnf copr недоступен — solopasha/hyprland не подключен'
+                        fi
+                    elif [[ "$c" == niri ]]; then
+                        if ! dnf info niri >/dev/null 2>&1; then
+                            if fedora_ensure_copr_plugin; then
+                                log_info 'Fedora: niri не найден в базовых репозиториях, подключаю COPR yalter/niri...'
+                                run_root dnf copr enable -y yalter/niri ||
+                                    log_warn 'COPR yalter/niri не включился — niri может не установиться'
+                            else
+                                log_warn 'Плагин dnf copr недоступен — yalter/niri не подключен'
+                            fi
+                        fi
+                    fi
+
+                    log_info "Fedora: устанавливаю композитор $pkg..."
+                    if ! run_root dnf install -y "$pkg"; then
+                        log_warn "compositor: $pkg не удалось установить"
+                        FAILED_PKGS+=("$pkg")
+                    fi
                 fi
             done
         fi
@@ -1356,7 +1405,9 @@ setup_services() {
     if [[ "$is" == systemd ]]; then
         run_root systemctl --global enable pipewire wireplumber pipewire-pulse || true
         systemctl --user start pipewire wireplumber pipewire-pulse || true
-        systemctl --user enable --now easyeffects.service || true
+        if systemctl --user list-unit-files easyeffects.service 2>/dev/null | grep -q -E '^easyeffects\.service([[:space:]]|$)'; then
+            systemctl --user enable --now easyeffects.service || true
+        fi
         run_root systemctl enable --now NetworkManager.service || true
     elif [[ "$is" == openrc ]]; then
         run_optional_root rc-update add NetworkManager default || true
@@ -2277,7 +2328,14 @@ ensure_update_dependencies() {
     bootstrap_installer_deps || true
 
     local missing=()
-    local cmd
+    local cmd comp
+    local comps=()
+
+    if [[ ${#SELECTED_COMPOSITORS[@]} -gt 0 ]]; then
+        comps=("${SELECTED_COMPOSITORS[@]}")
+    elif [[ ${#SELECTED_COMPOSITORS_SAVED[@]} -gt 0 ]]; then
+        comps=("${SELECTED_COMPOSITORS_SAVED[@]}")
+    fi
 
     for cmd in matugen quickshell; do
         if ! command -v "$cmd" >/dev/null 2>&1; then
@@ -2285,17 +2343,15 @@ ensure_update_dependencies() {
         fi
     done
 
+    for comp in "${comps[@]}"; do
+        if ! is_compositor_installed "$comp"; then
+            missing+=("$comp")
+        fi
+    done
+
     if [[ ${#missing[@]} -gt 0 ]]; then
         log_warn "Для обновления не хватает: ${missing[*]}"
         log_info 'Пытаюсь доставить зависимости через install_dependencies'
-
-        local comps=()
-
-        if [[ ${#SELECTED_COMPOSITORS[@]} -gt 0 ]]; then
-            comps=("${SELECTED_COMPOSITORS[@]}")
-        elif [[ ${#SELECTED_COMPOSITORS_SAVED[@]} -gt 0 ]]; then
-            comps=("${SELECTED_COMPOSITORS_SAVED[@]}")
-        fi
 
         if [[ ${#comps[@]} -gt 0 ]]; then
             install_dependencies "${comps[@]}" || true
@@ -2311,12 +2367,16 @@ ensure_update_dependencies() {
 
 # ---------- compositor detection ----------
 init_compositor_detection() {
+    if [[ ${#SELECTED_COMPOSITORS[@]} -gt 0 ]]; then
+        return 0
+    fi
+
     local installed=()
     local c
     local running=''
 
     for c in hyprland niri sway; do
-        if command -v "$c" >/dev/null 2>&1 || pkg_installed "$(comp_atom "$c")"; then
+        if is_compositor_installed "$c"; then
             installed+=("$c")
         fi
     done
@@ -2572,13 +2632,13 @@ manage_compositors_menu() {
     local sel
     local st_hypr="не установлен" st_niri="не установлен" st_sway="не установлен"
 
-    if command -v hyprland &>/dev/null || command -v Hyprland &>/dev/null || pkg_installed "$(comp_atom hyprland)" 2>/dev/null; then
+    if is_compositor_installed hyprland; then
         st_hypr="установлен"
     fi
-    if command -v niri &>/dev/null || pkg_installed "$(comp_atom niri)" 2>/dev/null; then
+    if is_compositor_installed niri; then
         st_niri="установлен"
     fi
-    if command -v sway &>/dev/null || pkg_installed "$(comp_atom sway)" 2>/dev/null; then
+    if is_compositor_installed sway; then
         st_sway="установлен"
     fi
 
