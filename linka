@@ -264,35 +264,33 @@ init_package_lists() {
         BOOTSTRAP_TOOLS=(jq curl git unzip fc-list)
         BOOTSTRAP_PKGS=(jq curl git unzip fontconfig)
     else
-        # Атомы, которых нет ни в одном подключённом репозитории, отфильтровываются
-        # в gentoo_filter_atoms (с предупреждением), а не валят весь emerge.
-        # Часть категорий может отличаться между ревизиями дерева — поэтому для
-        # xdg-desktop-portal-gtk и qt6ct указаны оба варианта.
+        # Атомы Gentoo выверены по основному дереву gentoo и оверлею guru.
+        # Атомы, отсутствующие в текущих репозиториях, отфильтровываются в gentoo_filter_atoms.
         REQUIRED_PKGS=(
-            dev-vcs/git media-libs/zbar media-sound/pavucontrol media-sound/alsa-utils
-            gui-apps/wl-clipboard sys-apps/fd app-text/ripgrep
-            app-misc/cliphist gui-apps/cliphist
+            dev-vcs/git media-gfx/zbar media-sound/pavucontrol media-sound/alsa-utils
+            gui-apps/wl-clipboard sys-apps/fd sys-apps/ripgrep
+            app-misc/cliphist
             app-misc/jq net-misc/socat sys-fs/inotify-tools media-sound/pamixer
-            sys-apps/brightnessctl sys-apps/ddcutil sys-power/acpi net-wireless/iw
+            app-misc/brightnessctl app-misc/ddcutil sys-power/acpi net-wireless/iw
             net-wireless/bluez x11-libs/libnotify net-misc/networkmanager
-            sys-apps/lm_sensors sys-devel/bc media-video/pipewire media-video/wireplumber
+            sys-apps/lm-sensors sys-devel/bc media-video/pipewire media-video/wireplumber
             media-libs/libpulse dev-lang/python media-gfx/imagemagick net-misc/wget
-            sys-apps/file sys-process/psmisc media-video/ffmpeg sys-apps/fastfetch
+            sys-apps/file sys-process/psmisc media-video/ffmpeg app-misc/fastfetch
             app-arch/unzip dev-python/websockets dev-qt/qtwebsockets dev-qt/qtmultimedia
             dev-qt/qt5compat gui-apps/grim media-sound/playerctl
-            sys-apps/xdg-desktop-portal-gtk x11-misc/xdg-desktop-portal-gtk
+            sys-apps/xdg-desktop-portal-gtk
             gui-apps/slurp x11-misc/wmctrl
             media-sound/easyeffects gnome-base/nautilus dev-qt/qtwayland
-            gui-apps/qt6ct x11-misc/qt6ct
+            gui-apps/qt6ct
             dev-qt/qtdeclarative dev-qt/qtsvg dev-qt/qtshadertools
-            media-video/wf-recorder x11-themes/adw-gtk-theme media-video/gpu-screen-recorder
+            gui-apps/wf-recorder x11-themes/adw-gtk3 media-video/gpu-screen-recorder
             x11-terms/kitty media-sound/cava gui-apps/quickshell
-            x11-misc/matugen media-gfx/matugen
-            gui-apps/satty media-gfx/satty
-            gui-apps/wl-gammarelay-rs sys-power/power-profiles-daemon
+            x11-misc/matugen
+            gui-apps/satty
+            sys-power/power-profiles-daemon
         )
         SDDM_PKGS=(x11-misc/sddm dev-qt/qtdeclarative dev-qt/qtsvg)
-        OPTIONAL_PKGS=()
+        OPTIONAL_PKGS=(gui-apps/wl-gammarelay-rs)
         BOOTSTRAP_TOOLS=(jq curl git unzip fc-list)
         BOOTSTRAP_PKGS=(app-misc/jq net-misc/curl dev-vcs/git app-arch/unzip media-libs/fontconfig)
     fi
@@ -324,6 +322,16 @@ pkg_installed() {
 
     # portageq есть всегда (sys-apps/portage); has_version как отдельная
     # команда вне ebuild-окружения не существует.
+    # Проверка /var/db/pkg даёт мгновенный ответ без запуска Python/portageq.
+    if [[ -d /var/db/pkg ]]; then
+        local clean="${pkg#[><=~]}"
+        clean="${clean%%:*}"
+        clean="${clean%%-[0-9]*}"
+        if compgen -G "/var/db/pkg/${clean}-[0-9]*" >/dev/null 2>&1; then
+            return 0
+        fi
+    fi
+
     if command -v portageq >/dev/null 2>&1; then
         if portageq has_version / "$pkg" >/dev/null 2>&1; then
             return 0
@@ -1009,7 +1017,7 @@ gentoo_ensure_guru() {
         return 0
     fi
 
-    log_info 'Gentoo: подключаю overlay guru (зеркало)...'
+    log_info 'Gentoo: подключаю overlay guru...'
 
     if [[ -e /var/db/repos/guru ]]; then
         local guru_bak="/var/db/repos/guru.linka-bak.$(date +%Y%m%d_%H%M%S)"
@@ -1021,20 +1029,44 @@ gentoo_ensure_guru() {
         fi
     fi
 
+    if command -v eselect >/dev/null 2>&1 && eselect modules list 2>/dev/null | grep -qw repository; then
+        if run_root eselect repository enable guru; then
+            log_ok 'guru включён через eselect repository.'
+            run_root emaint sync -r guru || true
+            if [[ -f /var/db/repos/guru/profiles/repo_name ]]; then
+                return 0
+            fi
+        fi
+    fi
+
     run_root mkdir -p /var/db/repos /etc/portage/repos.conf || true
 
     if run_root git clone --depth 1 https://github.com/gentoo-mirror/guru.git /var/db/repos/guru; then
-        if run_root tee /etc/portage/repos.conf/guru.conf >/dev/null <<'EOF_GURU'
+        if [[ -d /etc/portage/repos.conf ]]; then
+            if run_root tee /etc/portage/repos.conf/guru.conf >/dev/null <<'EOF_GURU'
 [guru]
 location = /var/db/repos/guru
 sync-type = git
 sync-uri = https://github.com/gentoo-mirror/guru.git
 auto-sync = yes
 EOF_GURU
-        then
-            log_ok 'guru подключён.'
-        else
-            log_warn 'guru: не удалось записать repos.conf'
+            then
+                log_ok 'guru подключён.'
+            else
+                log_warn 'guru: не удалось записать repos.conf'
+            fi
+        elif [[ -f /etc/portage/repos.conf ]]; then
+            if ! grep -q '\[guru\]' /etc/portage/repos.conf 2>/dev/null; then
+                run_root tee -a /etc/portage/repos.conf >/dev/null <<'EOF_GURU'
+
+[guru]
+location = /var/db/repos/guru
+sync-type = git
+sync-uri = https://github.com/gentoo-mirror/guru.git
+auto-sync = yes
+EOF_GURU
+            fi
+            log_ok 'guru подключён в /etc/portage/repos.conf.'
         fi
     else
         log_warn 'guru не подключился — quickshell/matugen могут не установиться.'
@@ -1043,9 +1075,79 @@ EOF_GURU
     return 0
 }
 
+gentoo_ensure_hyproverlay() {
+    if [[ -f /var/db/repos/hyproverlay/profiles/repo_name ]]; then
+        return 0
+    fi
+
+    log_info 'Gentoo: подключаю overlay hyproverlay...'
+
+    if [[ -e /var/db/repos/hyproverlay ]]; then
+        local hypr_bak="/var/db/repos/hyproverlay.linka-bak.$(date +%Y%m%d_%H%M%S)"
+        if run_root mv /var/db/repos/hyproverlay "$hypr_bak" 2>/dev/null; then
+            log_warn "Каталог /var/db/repos/hyproverlay не содержал валидного профиля оверлея и перемещён в $hypr_bak"
+        else
+            log_warn "Не удалось забэкапить невалидный /var/db/repos/hyproverlay — пропускаю подключение оверлея."
+            return 0
+        fi
+    fi
+
+    if command -v eselect >/dev/null 2>&1 && eselect modules list 2>/dev/null | grep -qw repository; then
+        if run_root eselect repository enable hyproverlay; then
+            log_ok 'hyproverlay включён через eselect repository.'
+            run_root emaint sync -r hyproverlay || true
+            if [[ -f /var/db/repos/hyproverlay/profiles/repo_name ]]; then
+                return 0
+            fi
+        fi
+    fi
+
+    run_root mkdir -p /var/db/repos /etc/portage/repos.conf || true
+
+    if run_root git clone --depth 1 https://codeberg.org/hyproverlay/hyproverlay.git /var/db/repos/hyproverlay; then
+        if [[ -d /etc/portage/repos.conf ]]; then
+            if run_root tee /etc/portage/repos.conf/hyproverlay.conf >/dev/null <<'EOF_HYPR'
+[hyproverlay]
+location = /var/db/repos/hyproverlay
+sync-type = git
+sync-uri = https://codeberg.org/hyproverlay/hyproverlay.git
+auto-sync = yes
+EOF_HYPR
+            then
+                log_ok 'hyproverlay подключён.'
+            else
+                log_warn 'hyproverlay: не удалось записать repos.conf'
+            fi
+        elif [[ -f /etc/portage/repos.conf ]]; then
+            if ! grep -q '\[hyproverlay\]' /etc/portage/repos.conf 2>/dev/null; then
+                run_root tee -a /etc/portage/repos.conf >/dev/null <<'EOF_HYPR'
+
+[hyproverlay]
+location = /var/db/repos/hyproverlay
+sync-type = git
+sync-uri = https://codeberg.org/hyproverlay/hyproverlay.git
+auto-sync = yes
+EOF_HYPR
+            fi
+            log_ok 'hyproverlay подключён в /etc/portage/repos.conf.'
+        fi
+    else
+        log_warn 'hyproverlay не подключился — gui-wm/hyprland может не установиться.'
+    fi
+
+    return 0
+}
+
 gentoo_sync_tree() {
-    log_info 'Gentoo: emerge-webrsync...'
-    run_root emerge-webrsync || log_warn 'webrsync не удался'
+    # Если основное дерево Gentoo уже существует, не запускаем emerge-webrsync,
+    # чтобы не перезаписывать git/rsync дерево тяжеловесным архивом.
+    # Достаточно синхронизировать guru при наличии.
+    if [[ ! -f /var/db/repos/gentoo/profiles/repo_name ]]; then
+        log_info 'Gentoo: дерево отсутствует, запускаю emerge-webrsync...'
+        run_root emerge-webrsync || log_warn 'webrsync не удался'
+    elif [[ -d /var/db/repos/guru ]]; then
+        run_root emaint sync -r guru >/dev/null 2>&1 || true
+    fi
     return 0
 }
 
@@ -1110,6 +1212,10 @@ gentoo_filter_atoms() {
 }
 
 gentoo_apply_autounmask_cfg() {
+    if command -v etc-update >/dev/null 2>&1; then
+        run_root etc-update --automode -5 /etc/portage >/dev/null 2>&1 || true
+    fi
+
     local cfg_file target_file dir base name
     # 1. Каталоги /etc/portage/package.* (package.use, package.accept_keywords, package.mask, package.unmask, package.license, package.env)
     for dir in /etc/portage/package.*; do
@@ -1120,7 +1226,12 @@ gentoo_apply_autounmask_cfg() {
                 if [[ "$base" =~ ^\._cfg[0-9]+_(.+)$ ]]; then
                     name="${BASH_REMATCH[1]}"
                     target_file="$dir/$name"
-                    run_root mv -f "$cfg_file" "$target_file" || true
+                    if [[ -f "$target_file" ]]; then
+                        run_root tee -a "$target_file" < "$cfg_file" >/dev/null || true
+                        run_root rm -f "$cfg_file" || true
+                    else
+                        run_root mv -f "$cfg_file" "$target_file" || true
+                    fi
                 fi
             done < <(find "$dir" -maxdepth 1 -name '._cfg[0-9]*_*' 2>/dev/null | sort -V)
         fi
@@ -1133,7 +1244,12 @@ gentoo_apply_autounmask_cfg() {
         if [[ "$base" =~ ^\._cfg[0-9]+_(package\..+)$ ]]; then
             name="${BASH_REMATCH[1]}"
             target_file="/etc/portage/$name"
-            run_root mv -f "$cfg_file" "$target_file" || true
+            if [[ -f "$target_file" ]]; then
+                run_root tee -a "$target_file" < "$cfg_file" >/dev/null || true
+                run_root rm -f "$cfg_file" || true
+            else
+                run_root mv -f "$cfg_file" "$target_file" || true
+            fi
         fi
     done < <(find /etc/portage -maxdepth 1 -name '._cfg[0-9]*_package.*' 2>/dev/null | sort -V)
 
@@ -1310,14 +1426,21 @@ install_dependencies() {
     else
         target_list=("${REQUIRED_PKGS[@]}")
 
+        local serp_use=(
+            "media-video/pipewire dbus extra sound-server"
+            "dev-qt/qtmultimedia qml ffmpeg"
+            "gui-apps/quickshell layer-shell pipewire screencopy"
+        )
+
         if [[ -d /etc/portage/package.use ]]; then
             run_root tee /etc/portage/package.use/serpantinum >/dev/null <<'EOF_USE' || log_warn 'Gentoo: не удалось записать package.use/serpantinum'
-media-video/pipewire dbus extra
+media-video/pipewire dbus extra sound-server
 dev-qt/qtmultimedia qml ffmpeg
+gui-apps/quickshell layer-shell pipewire screencopy
 EOF_USE
         elif [[ -f /etc/portage/package.use ]]; then
             local uflag
-            for uflag in "media-video/pipewire dbus extra" "dev-qt/qtmultimedia qml ffmpeg"; do
+            for uflag in "${serp_use[@]}"; do
                 if ! grep -Fxq "$uflag" /etc/portage/package.use 2>/dev/null; then
                     printf '%s\n' "$uflag" | run_root tee -a /etc/portage/package.use >/dev/null || true
                 fi
@@ -1325,8 +1448,9 @@ EOF_USE
         else
             run_root mkdir -p /etc/portage/package.use || log_warn 'Gentoo: не удалось создать /etc/portage/package.use'
             run_root tee /etc/portage/package.use/serpantinum >/dev/null <<'EOF_USE' || log_warn 'Gentoo: не удалось записать package.use/serpantinum'
-media-video/pipewire dbus extra
+media-video/pipewire dbus extra sound-server
 dev-qt/qtmultimedia qml ffmpeg
+gui-apps/quickshell layer-shell pipewire screencopy
 EOF_USE
         fi
 
@@ -1335,12 +1459,28 @@ EOF_USE
 
         if [[ ${#compositors[@]} -gt 0 ]]; then
             for comp in "${compositors[@]}"; do
-                target_list+=("$(comp_atom "$comp")")
+                c="${comp,,}"
+                if [[ "$c" == hyprland ]]; then
+                    gentoo_ensure_hyproverlay
+                fi
+                target_list+=("$(comp_atom "$c")")
             done
         fi
 
         if [[ "$OPT_SDDM" == true && ${#SDDM_PKGS[@]} -gt 0 ]]; then
-            target_list+=("${SDDM_PKGS[@]}")
+            local sddm_atoms=("${SDDM_PKGS[@]}")
+            if [[ "$(detect_init_system)" == openrc ]]; then
+                sddm_atoms+=(gui-libs/display-manager-init)
+            fi
+            target_list+=("${sddm_atoms[@]}")
+        fi
+
+        if [[ ${#OPTIONAL_PKGS[@]} -gt 0 ]]; then
+            local opt_avail=()
+            mapfile -t opt_avail < <(gentoo_filter_atoms "${OPTIONAL_PKGS[@]}" 2>/dev/null || true)
+            if [[ ${#opt_avail[@]} -gt 0 && -n "${opt_avail[0]}" ]]; then
+                target_list+=("${opt_avail[@]}")
+            fi
         fi
 
         local filtered=()
@@ -1409,9 +1549,16 @@ setup_services() {
             systemctl --user enable --now easyeffects.service || true
         fi
         run_root systemctl enable --now NetworkManager.service || true
+        if systemctl list-unit-files power-profiles-daemon.service 2>/dev/null | grep -q -E '^power-profiles-daemon\.service([[:space:]]|$)'; then
+            run_root systemctl enable --now power-profiles-daemon.service || true
+        fi
     elif [[ "$is" == openrc ]]; then
         run_optional_root rc-update add NetworkManager default || true
         run_optional_root rc-service NetworkManager start || true
+        if [[ -f /etc/init.d/power-profiles-daemon ]]; then
+            run_optional_root rc-update add power-profiles-daemon default || true
+            run_optional_root rc-service power-profiles-daemon start || true
+        fi
     fi
 
     return 0
@@ -2024,11 +2171,23 @@ ensure_sddm_package() {
 
         run_root dnf install -y sddm qt6-qtdeclarative qt6-qtsvg || return 1
     else
-        if pkg_installed x11-misc/sddm; then
+        local sddm_atoms=(x11-misc/sddm dev-qt/qtdeclarative dev-qt/qtsvg)
+        if [[ "$(detect_init_system)" == openrc ]]; then
+            sddm_atoms+=(gui-libs/display-manager-init)
+        fi
+
+        local missing=()
+        for a in "${sddm_atoms[@]}"; do
+            if ! pkg_installed "$a"; then
+                missing+=("$a")
+            fi
+        done
+
+        if [[ ${#missing[@]} -eq 0 ]]; then
             return 0
         fi
 
-        run_root emerge --ask=n x11-misc/sddm dev-qt/qtdeclarative dev-qt/qtsvg || return 1
+        run_root emerge --ask=n "${missing[@]}" || return 1
     fi
 
     return 0
@@ -2095,10 +2254,16 @@ EOF_SDDM
             return 0
         fi
     elif [[ "$(detect_init_system)" == openrc ]]; then
-        if run_optional_root rc-update add sddm default 2>/dev/null || run_optional_root rc-update add display-manager default 2>/dev/null; then
+        if [[ -f /etc/conf.d/display-manager ]]; then
+            run_optional_root sed -i 's/^[#[:space:]]*DISPLAYMANAGER=.*/DISPLAYMANAGER="sddm"/' /etc/conf.d/display-manager 2>/dev/null || true
+        else
+            printf 'DISPLAYMANAGER="sddm"\n' | run_optional_root tee /etc/conf.d/display-manager >/dev/null || true
+        fi
+
+        if run_optional_root rc-update add display-manager default 2>/dev/null || run_optional_root rc-update add sddm default 2>/dev/null; then
             update_state_field SDDM_ENABLED_BY_LINKA true
         else
-            log_warn 'SDDM: не удалось добавить sddm в rc-update'
+            log_warn 'SDDM: не удалось добавить display-manager/sddm в rc-update'
         fi
     fi
 
