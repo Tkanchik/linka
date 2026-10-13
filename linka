@@ -249,7 +249,7 @@ init_package_lists() {
     if [[ "$DISTRO" == 'fedora' ]]; then
         REQUIRED_PKGS=(
             kitty cava zbar pavucontrol alsa-utils wl-clipboard fd-find ripgrep
-            cliphist jq socat inotify-tools pamixer brightnessctl ddcutil acpi iw
+            jq socat inotify-tools pamixer brightnessctl ddcutil acpi iw
             bluez libnotify NetworkManager lm_sensors bc pipewire wireplumber
             pipewire-pulseaudio pipewire-alsa pulseaudio-libs python3 ImageMagick
             wget file git psmisc ffmpeg-free fastfetch unzip python3-websockets
@@ -260,7 +260,7 @@ init_package_lists() {
             qt6-qtdeclarative qt6-qtsvg qt6-qtshadertools
         )
         SDDM_PKGS=(sddm qt6-qtdeclarative qt6-qtsvg)
-        OPTIONAL_PKGS=(quickshell matugen satty wl-gammarelay-rs)
+        OPTIONAL_PKGS=(quickshell matugen satty wl-gammarelay-rs cliphist)
         BOOTSTRAP_TOOLS=(jq curl git unzip fc-list)
         BOOTSTRAP_PKGS=(jq curl git unzip fontconfig)
     else
@@ -315,6 +315,12 @@ pkg_installed() {
 
     if [[ "$DISTRO" == 'fedora' ]]; then
         if rpm -q "$pkg" >/dev/null 2>&1; then
+            return 0
+        fi
+        if rpm -q --whatprovides "$pkg" >/dev/null 2>&1; then
+            return 0
+        fi
+        if command -v "$pkg" >/dev/null 2>&1; then
             return 0
         fi
         return 1
@@ -1285,16 +1291,38 @@ gentoo_autounmask_resolve() {
 
 # ---- Fedora helpers ----
 fedora_ensure_copr_plugin() {
-    if dnf copr --help >/dev/null 2>&1; then
+    local dnf_cmd="dnf"
+    if ! command -v dnf >/dev/null 2>&1 && command -v dnf5 >/dev/null 2>&1; then
+        dnf_cmd="dnf5"
+    fi
+
+    if "$dnf_cmd" copr --help >/dev/null 2>&1; then
         return 0
     fi
 
     log_info 'Fedora: ставлю плагин dnf copr...'
-    run_root dnf install -y dnf5-plugins >/dev/null 2>&1 ||
-        run_root dnf install -y dnf-plugins-core >/dev/null 2>&1 ||
+
+    local plugin_pkg="dnf-plugins-core"
+    if "$dnf_cmd" --version 2>/dev/null | grep -q -E '^(dnf5|5\.)'; then
+        plugin_pkg="dnf5-plugins"
+    fi
+
+    run_root "$dnf_cmd" install -y "$plugin_pkg" >/dev/null 2>&1 ||
+        run_root "$dnf_cmd" install -y dnf-plugins-core >/dev/null 2>&1 ||
         return 1
 
-    dnf copr --help >/dev/null 2>&1
+    "$dnf_cmd" copr --help >/dev/null 2>&1
+}
+
+fedora_enable_copr() {
+    local repo="$1"
+    local dnf_cmd="dnf"
+    if ! command -v dnf >/dev/null 2>&1 && command -v dnf5 >/dev/null 2>&1; then
+        dnf_cmd="dnf5"
+    fi
+
+    fedora_ensure_copr_plugin || return 1
+    run_root "$dnf_cmd" copr enable -y "$repo"
 }
 
 # Версия quickshell (X.Y.Z) из `quickshell --version`; пусто, если не удалось.
@@ -1353,7 +1381,7 @@ install_dependencies() {
     if [[ "$DISTRO" == 'fedora' ]]; then
         for pkg in "${REQUIRED_PKGS[@]}"; do
             # ffmpeg-free конфликтует с ffmpeg из RPM Fusion и валит транзакцию
-            if [[ "$pkg" == ffmpeg-free ]] && rpm -q ffmpeg >/dev/null 2>&1; then
+            if [[ "$pkg" == ffmpeg-free ]] && { rpm -q ffmpeg >/dev/null 2>&1 || rpm -q ffmpeg-libs >/dev/null 2>&1; }; then
                 log_info 'ffmpeg (RPM Fusion) уже установлен — пропускаю ffmpeg-free'
                 continue
             fi
@@ -1369,8 +1397,10 @@ install_dependencies() {
         fi
 
         if fedora_ensure_copr_plugin; then
-            run_root dnf copr enable -y errornointernet/quickshell ||
-                log_warn 'COPR errornointernet/quickshell не включился — quickshell/matugen могут не поставиться'
+            fedora_enable_copr errornointernet/quickshell ||
+                log_warn 'COPR errornointernet/quickshell не включился — quickshell может не поставиться'
+            fedora_enable_copr solopasha/hyprland ||
+                log_warn 'COPR solopasha/hyprland не включился — matugen/satty/hyprland могут не поставиться'
         else
             log_warn 'Плагин dnf copr недоступен — quickshell/matugen из COPR не поставятся'
         fi
@@ -1381,7 +1411,7 @@ install_dependencies() {
         if [[ ${#OPTIONAL_PKGS[@]} -gt 0 ]]; then
             for pkg in "${OPTIONAL_PKGS[@]}"; do
                 if ! pkg_installed "$pkg"; then
-                    run_root dnf install -y "$pkg" || log_warn "optional: $pkg недоступен"
+                    run_root dnf install -y --skip-unavailable "$pkg" || log_warn "optional: $pkg недоступен"
                 fi
             done
         fi
@@ -1394,7 +1424,7 @@ install_dependencies() {
                     if [[ "$c" == hyprland ]]; then
                         if fedora_ensure_copr_plugin; then
                             log_info 'Fedora: подключаю COPR solopasha/hyprland...'
-                            run_root dnf copr enable -y solopasha/hyprland ||
+                            fedora_enable_copr solopasha/hyprland ||
                                 log_warn 'COPR solopasha/hyprland не включился — hyprland может не установиться'
                         else
                             log_warn 'Плагин dnf copr недоступен — solopasha/hyprland не подключен'
@@ -1403,7 +1433,7 @@ install_dependencies() {
                         if ! dnf info niri >/dev/null 2>&1; then
                             if fedora_ensure_copr_plugin; then
                                 log_info 'Fedora: niri не найден в базовых репозиториях, подключаю COPR yalter/niri...'
-                                run_root dnf copr enable -y yalter/niri ||
+                                fedora_enable_copr yalter/niri ||
                                     log_warn 'COPR yalter/niri не включился — niri может не установиться'
                             else
                                 log_warn 'Плагин dnf copr недоступен — yalter/niri не подключен'
@@ -1552,12 +1582,19 @@ setup_services() {
         if systemctl list-unit-files power-profiles-daemon.service 2>/dev/null | grep -q -E '^power-profiles-daemon\.service([[:space:]]|$)'; then
             run_root systemctl enable --now power-profiles-daemon.service || true
         fi
+        if systemctl list-unit-files tuned.service 2>/dev/null | grep -q -E '^tuned\.service([[:space:]]|$)'; then
+            run_root systemctl enable --now tuned.service || true
+        fi
     elif [[ "$is" == openrc ]]; then
         run_optional_root rc-update add NetworkManager default || true
         run_optional_root rc-service NetworkManager start || true
         if [[ -f /etc/init.d/power-profiles-daemon ]]; then
             run_optional_root rc-update add power-profiles-daemon default || true
             run_optional_root rc-service power-profiles-daemon start || true
+        fi
+        if [[ -f /etc/init.d/tuned ]]; then
+            run_optional_root rc-update add tuned default || true
+            run_optional_root rc-service tuned start || true
         fi
     fi
 
@@ -2160,16 +2197,36 @@ other_display_manager_enabled() {
         return 0
     fi
 
+    local dm
+    for dm in gdm lightdm greetd lxdm; do
+        if systemctl is-active --quiet "$dm.service" 2>/dev/null ||
+           systemctl is-enabled --quiet "$dm.service" 2>/dev/null; then
+            return 0
+        fi
+    done
+
     return 1
 }
 
 ensure_sddm_package() {
     if [[ "$DISTRO" == fedora ]]; then
-        if pkg_installed sddm; then
+        local pkgs=("${SDDM_PKGS[@]}")
+        if [[ ${#pkgs[@]} -eq 0 ]]; then
+            pkgs=(sddm qt6-qtdeclarative qt6-qtsvg)
+        fi
+        local missing=()
+        local pkg
+        for pkg in "${pkgs[@]}"; do
+            if ! pkg_installed "$pkg"; then
+                missing+=("$pkg")
+            fi
+        done
+
+        if [[ ${#missing[@]} -eq 0 ]]; then
             return 0
         fi
 
-        run_root dnf install -y sddm qt6-qtdeclarative qt6-qtsvg || return 1
+        run_root dnf install -y "${missing[@]}" || return 1
     else
         local sddm_atoms=(x11-misc/sddm dev-qt/qtdeclarative dev-qt/qtsvg)
         if [[ "$(detect_init_system)" == openrc ]]; then
@@ -2565,10 +2622,10 @@ init_compositor_detection() {
 
     SELECTED_COMPOSITORS=()
 
-    if [[ -n "$running" ]]; then
-        SELECTED_COMPOSITORS=("$running")
-    elif [[ ${#SELECTED_COMPOSITORS_SAVED[@]} -gt 0 ]]; then
+    if [[ ${#SELECTED_COMPOSITORS_SAVED[@]} -gt 0 ]]; then
         SELECTED_COMPOSITORS=("${SELECTED_COMPOSITORS_SAVED[@]}")
+    elif [[ -n "$running" ]]; then
+        SELECTED_COMPOSITORS=("$running")
     elif [[ ${#installed[@]} -eq 1 ]]; then
         SELECTED_COMPOSITORS=("${installed[0]}")
     fi
@@ -2997,6 +3054,7 @@ run_user_post_update_hook() {
 
 flow_install() {
     local requested="$1"
+    shift || true
     local sel
 
     INSTALL_STATE="$(detect_install_state)"
@@ -3012,6 +3070,19 @@ flow_install() {
 
     if [[ "$requested" == reinstall ]]; then
         IS_REINSTALL=true
+    fi
+
+    local cli_comps=()
+    local comp_arg
+    for comp_arg in "$@"; do
+        case "${comp_arg,,}" in
+            hyprland|niri|sway)
+                cli_comps+=("${comp_arg,,}")
+                ;;
+        esac
+    done
+    if [[ ${#cli_comps[@]} -gt 0 ]]; then
+        SELECTED_COMPOSITORS=("${cli_comps[@]}")
     fi
 
     init_compositor_detection
@@ -3539,7 +3610,7 @@ auto_privileged_commands() {
 
     if [[ "$DISTRO" == fedora ]]; then
         if [[ "$mode" == apply ]]; then
-            bin="$(command -v dnf 2>/dev/null || true)"
+            bin="$(command -v dnf 2>/dev/null || command -v dnf5 2>/dev/null || true)"
             if [[ -n "$bin" ]]; then
                 printf '%s %s\n' "$bin" "${AUTO_DNF_APPLY[*]}"
             fi
@@ -3640,21 +3711,25 @@ auto_install_sudoers() {
 # `dnf needs-restarting -r` сам возвращает 1, когда перезагрузка нужна, поэтому
 # смотрим на текст, а не на код возврата (и не через pipe — мешает pipefail).
 auto_reboot_hint() {
-    local out
-    out="$(dnf needs-restarting -r 2>&1 || true)"
+    local out bin
+    bin="$(command -v dnf 2>/dev/null || command -v dnf5 2>/dev/null || true)"
+    if [[ -z "$bin" ]]; then
+        return 1
+    fi
+    out="$("$bin" needs-restarting -r 2>&1 || true)"
     grep -qi 'reboot is required' <<< "$out"
 }
 
 auto_system_fedora() {
     local mode="$1" rc=0 bin
 
-    bin="$(command -v dnf 2>/dev/null || true)"
+    bin="$(command -v dnf 2>/dev/null || command -v dnf5 2>/dev/null || true)"
     if [[ -z "$bin" ]]; then
         log_warn 'Система: dnf не найден.'
         return 0
     fi
 
-    "$bin" -q --refresh check-upgrade >/dev/null 2>&1 || rc=$?
+    "$bin" -q --refresh check-update >/dev/null 2>&1 || rc=$?
 
     case "$rc" in
         0)
@@ -3665,7 +3740,7 @@ auto_system_fedora() {
         100)
             ;;
         *)
-            log_warn "Система: dnf check-upgrade завершился с кодом $rc."
+            log_warn "Система: dnf check-update завершился с кодом $rc."
             return 0
             ;;
     esac
@@ -4510,12 +4585,14 @@ main() {
             usage
             ;;
         install|--install)
+            shift
             prepare_environment
-            flow_install install
+            flow_install install "$@"
             ;;
         reinstall|--reinstall)
+            shift
             prepare_environment
-            flow_install reinstall
+            flow_install reinstall "$@"
             ;;
         update|--update)
             if [[ "${2:-}" == "--force" || "${2:-}" == "-f" ]]; then

@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+# Mock readlink tool for linka E2E tests
+set -euo pipefail
+
+MOCK_LOGS="${MOCK_LOGS:-/tmp/linka_test_logs}"
+MOCK_ROOT="${MOCK_ROOT:-/tmp/linka_test_root}"
+mkdir -p "$MOCK_LOGS"
+
+echo "$0 $*" >> "$MOCK_LOGS/readlink.log"
+
+# Check if target is display-manager.service
+for arg in "$@"; do
+    if [[ "$arg" == *"/etc/systemd/system/display-manager.service" ]]; then
+        if [[ -n "${MOCK_DM_LINK:-}" ]]; then
+            if [[ "$MOCK_DM_LINK" == "none" ]]; then
+                exit 1
+            fi
+            echo "$MOCK_DM_LINK"
+            exit 0
+        fi
+        if [[ -L "$MOCK_ROOT/etc/systemd/system/display-manager.service" ]]; then
+            exec /usr/bin/readlink -f "$MOCK_ROOT/etc/systemd/system/display-manager.service"
+        fi
+        exit 1
+    fi
+done
+
+exec /usr/bin/readlink "$@"

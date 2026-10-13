@@ -1,0 +1,158 @@
+#!/usr/bin/env bash
+# Mock DNF / DNF5 package manager for linka E2E tests
+set -euo pipefail
+
+MOCK_LOGS="${MOCK_LOGS:-/tmp/linka_test_logs}"
+MOCK_DNF_STATE="${MOCK_DNF_STATE:-/tmp/linka_test_dnf_state}"
+mkdir -p "$MOCK_LOGS" "$MOCK_DNF_STATE"
+
+echo "$0 $*" >> "$MOCK_LOGS/dnf.log"
+
+# Determine if running in DNF4 or DNF5 mode
+is_dnf5=0
+if [[ "$(basename "$0")" == "dnf5" || "${MOCK_DNF_VERSION:-4}" == "5" ]]; then
+    is_dnf5=1
+fi
+
+# Flag processing
+subcmd=""
+args=()
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --version)
+            if [[ "$is_dnf5" -eq 1 ]]; then
+                echo "dnf5 version 5.2.7.0"
+            else
+                echo "4.19.2"
+                echo "  Loaded plugins: builddep, changelog, config-manager, copr, debug, download"
+            fi
+            exit 0
+            ;;
+        -y|--assumeyes|-q|--quiet|--refresh|--skip-unavailable)
+            args+=("$1")
+            shift
+            ;;
+        *)
+            if [[ -z "$subcmd" ]]; then
+                subcmd="$1"
+            else
+                args+=("$1")
+            fi
+            shift
+            ;;
+    esac
+done
+
+copr_plugin_file="$MOCK_DNF_STATE/copr_plugin_active"
+
+case "$subcmd" in
+    copr)
+        action="${args[0]:-}"
+        if [[ "$action" == "--help" || "$action" == "-h" ]]; then
+            if [[ -f "$copr_plugin_file" && "$(cat "$copr_plugin_file")" == "1" ]] || [[ "${MOCK_COPR_PLUGIN_ENABLED:-0}" == "1" ]]; then
+                echo "usage: dnf copr [enable|disable|list|search] ..."
+                exit 0
+            else
+                echo "No such command: copr. Please use /usr/bin/dnf --help" >&2
+                exit 1
+            fi
+        elif [[ "$action" == "enable" ]]; then
+            # Verify if -y is present in flags or args
+            repo=""
+            has_y=0
+            for a in "${args[@]}"; do
+                if [[ "$a" == "-y" || "$a" == "--assumeyes" ]]; then
+                    has_y=1
+                elif [[ "$a" != "enable" && "$a" != -* ]]; then
+                    repo="$a"
+                fi
+            done
+            echo "REPO=$repo HAS_Y=$has_y ARGS=${args[*]}" >> "$MOCK_LOGS/dnf_copr.log"
+            exit "${MOCK_COPR_ENABLE_EXIT_CODE:-0}"
+        else
+            echo "Mock copr subaction: $action" >> "$MOCK_LOGS/dnf_copr.log"
+            exit 0
+        fi
+        ;;
+
+    install)
+        pkgs=()
+        for a in "${args[@]}"; do
+            if [[ "$a" != -* ]]; then
+                pkgs+=("$a")
+            fi
+        done
+        echo "${pkgs[*]}" >> "$MOCK_LOGS/dnf_install.log"
+
+        for p in "${pkgs[@]}"; do
+            if [[ "$p" == "dnf-plugins-core" && "$is_dnf5" -eq 0 ]]; then
+                echo "1" > "$copr_plugin_file"
+            elif [[ "$p" == "dnf5-plugins" && "$is_dnf5" -eq 1 ]]; then
+                echo "1" > "$copr_plugin_file"
+            fi
+        done
+
+        exit "${MOCK_DNF_INSTALL_EXIT_CODE:-0}"
+        ;;
+
+    info)
+        pkg="${args[0]:-}"
+        avail_file="$MOCK_DNF_STATE/available_pkgs"
+        avail_pkgs="${MOCK_DNF_AVAILABLE_PKGS:-}"
+        if [[ -f "$avail_file" ]]; then
+            avail_pkgs="$avail_pkgs $(cat "$avail_file")"
+        fi
+
+        found=0
+        for p in $avail_pkgs; do
+            if [[ "$p" == "$pkg" ]]; then
+                found=1
+                break
+            fi
+        done
+
+        if [[ "$found" -eq 1 ]]; then
+            echo "Name         : $pkg"
+            echo "Version      : 1.0.0"
+            echo "Repo         : fedora"
+            exit 0
+        else
+            echo "Error: No matching Packages to list" >&2
+            exit 1
+        fi
+        ;;
+
+    check-upgrade)
+        if [[ "$is_dnf5" -eq 0 ]]; then
+            # Exact DNF4 behavior: check-upgrade does not exist in DNF4
+            echo "No such command: check-upgrade. Please use /usr/bin/dnf --help" >&2
+            exit 1
+        else
+            exit "${MOCK_DNF_CHECK_UPDATE_EXIT_CODE:-0}"
+        fi
+        ;;
+
+    check-update)
+        exit "${MOCK_DNF_CHECK_UPDATE_EXIT_CODE:-0}"
+        ;;
+
+    upgrade)
+        echo "UPGRADE: ${args[*]}" >> "$MOCK_LOGS/dnf_upgrade.log"
+        exit "${MOCK_DNF_UPGRADE_EXIT_CODE:-0}"
+        ;;
+
+    needs-restarting)
+        if [[ "${MOCK_NEEDS_RESTARTING:-0}" == "1" ]]; then
+            echo "Core libraries or services have been updated: reboot is required"
+            exit 1
+        else
+            echo "No core libraries or services have been updated"
+            exit 0
+        fi
+        ;;
+
+    *)
+        echo "Mock DNF unhandled: $subcmd ${args[*]}" >> "$MOCK_LOGS/dnf.log"
+        exit 0
+        ;;
+esac
