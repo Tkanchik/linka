@@ -12,6 +12,7 @@ ExecStart={linka_path} auto run
 Environment=PATH={bin_dir}:/usr/local/bin:/usr/bin:/bin
 Nice=15
 IOSchedulingClass=idle
+KillMode=process
 """
 
 TIMER_TEMPLATE = """[Unit]
