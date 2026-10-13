@@ -1,9 +1,0 @@
-#!/usr/bin/env bash
-# Mock notify-send for linka E2E tests
-set -euo pipefail
-
-MOCK_LOGS="${MOCK_LOGS:-/tmp/linka_test_logs}"
-mkdir -p "$MOCK_LOGS"
-
-echo "NOTIFY: $*" >> "$MOCK_LOGS/notify.log"
-exit 0
