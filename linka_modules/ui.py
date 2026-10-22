@@ -11,7 +11,6 @@ from .daemon import enable_daemon, disable_daemon, daemon_status
 from .hooks import run_post_update
 
 def flow_install(reinstall: bool = False, compositor: str = "niri", sddm: bool = False):
-    """Полный процесс первичной установки или переустановки."""
     distro = detect_distro()
     if not distro:
         log_warn("Не удалось точно определить дистрибутив (ожидается Gentoo или Fedora). Продолжаем...")
@@ -25,24 +24,18 @@ def flow_install(reinstall: bool = False, compositor: str = "niri", sddm: bool =
         log_error("Не удалось получить репозиторий Serpantinum.")
         return False
 
-    # Развёртывание ядра
     if not deploy_core(repo):
         return False
 
-    # Развёртывание шрифтов
     deploy_fonts(repo)
 
-    # Развёртывание конфигурации композитора
     deploy_compositor(repo, compositor=compositor, overwrite=reinstall)
 
-    # Развёртывание пользовательских конфигов (kitty, cava, fastfetch)
     deploy_user_configs(repo, is_update=False)
 
-    # SDDM
     if sddm:
         deploy_sddm_theme(repo, enable=True)
 
-    # Сохранение коммита
     commit = get_repo_commit(repo)
     try:
         from .common import TARGET_BASE
@@ -50,7 +43,6 @@ def flow_install(reinstall: bool = False, compositor: str = "niri", sddm: bool =
     except Exception:
         pass
 
-    # Вызов хуков
     run_post_update()
 
     log_ok("Установка Serpantinum успешно завершена!")
@@ -58,14 +50,12 @@ def flow_install(reinstall: bool = False, compositor: str = "niri", sddm: bool =
     return True
 
 def flow_kill():
-    """Остановка процессов Serpantinum."""
     log_info("Остановка процессов Serpantinum и Quickshell...")
     run_cmd(["pkill", "-TERM", "-f", "focus_daemon.py"])
     run_cmd(["pkill", "-TERM", "-x", "quickshell"])
     log_ok("Процессы остановлены.")
 
 def flow_remove():
-    """Удаление Serpantinum."""
     from .common import TARGET_BASE, BIN_DIR
     confirm = input("Вы уверены, что хотите удалить Serpantinum? (y/N): ").strip().lower()
     if confirm not in ("y", "yes", "да"):
@@ -86,7 +76,6 @@ def flow_remove():
     log_ok("Serpantinum удалён из системы.")
 
 def interactive_menu():
-    """Интерактивное консольное меню при запуске без аргументов."""
     while True:
         print(f"\n{Colors.BOLD}linka — Установщик и менеджер Serpantinum{Colors.RESET}")
         print("─" * 45)
@@ -137,28 +126,22 @@ def main():
     )
     subparsers = parser.add_subparsers(dest="command")
 
-    # install
     p_install = subparsers.add_parser("install", help="Чистая установка Serpantinum")
     p_install.add_argument("--compositor", default="niri", choices=["niri", "hyprland", "sway"], help="Выбор композитора")
     p_install.add_argument("--sddm", action="store_true", help="Установить тему SDDM")
 
-    # reinstall
     p_reinstall = subparsers.add_parser("reinstall", help="Переустановка с обновлением конфигов")
     p_reinstall.add_argument("--compositor", default="niri", choices=["niri", "hyprland", "sway"], help="Выбор композитора")
 
-    # update
     p_update = subparsers.add_parser("update", help="Обновление Serpantinum")
     p_update.add_argument("-f", "--force", action="store_true", help="Принудительное обновление")
     p_update.add_argument("--branch", default="master", help="Ветка репозитория")
 
-    # auto
     p_auto = subparsers.add_parser("auto", help="Управление службой автообновлений")
     p_auto.add_argument("action", choices=["enable", "disable", "status", "run"], help="Действие со службой")
 
-    # kill
     subparsers.add_parser("kill", help="Остановить все процессы шелла")
 
-    # remove
     subparsers.add_parser("remove", help="Удалить Serpantinum")
 
     args = parser.parse_args()

@@ -15,7 +15,6 @@ from .common import (
 )
 
 def copy_tree(src: Path, dst: Path, overwrite: bool = True):
-    """Рекурсивное копирование дерева файлов."""
     dst.mkdir(parents=True, exist_ok=True)
     for item in src.iterdir():
         target = dst / item.name
@@ -26,7 +25,6 @@ def copy_tree(src: Path, dst: Path, overwrite: bool = True):
                 shutil.copy2(item, target)
 
 def deploy_core(repo_dir: Path) -> bool:
-    """Развёртывание ядра Serpantinum (bin/ и src/) в TARGET_BASE."""
     log_info(f"Развёртывание Serpantinum в {TARGET_BASE}...")
 
     src_dir = repo_dir / "src"
@@ -39,16 +37,13 @@ def deploy_core(repo_dir: Path) -> bool:
 
     TARGET_BASE.mkdir(parents=True, exist_ok=True)
 
-    # 1. Копирование src/
     target_src = TARGET_BASE / "src"
     copy_tree(src_dir, target_src)
 
-    # 2. Копирование bin/
     if bin_dir.exists():
         target_bin = TARGET_BASE / "bin"
         copy_tree(bin_dir, target_bin)
 
-    # 3. Копирование version.txt (важно для корректной работы Updater.qml!)
     if version_file.exists():
         shutil.copy2(version_file, TARGET_BASE / "version.txt")
     elif (src_dir / "version.txt").exists():
@@ -58,14 +53,12 @@ def deploy_core(repo_dir: Path) -> bool:
         except Exception:
             pass
 
-    # 4. Установка прав на исполнение для всех скриптов
     for p in TARGET_BASE.glob("**/*.sh"):
         p.chmod(p.stat().st_mode | 0o111)
     if (TARGET_BASE / "bin").exists():
         for p in (TARGET_BASE / "bin").iterdir():
             p.chmod(p.stat().st_mode | 0o111)
 
-    # 5. Создание симлинков в ~/.local/bin
     BIN_DIR.mkdir(parents=True, exist_ok=True)
     for script_name in ["serpantinum", "serpantinumd"]:
         source_script = TARGET_BASE / "bin" / script_name
@@ -80,7 +73,6 @@ def deploy_core(repo_dir: Path) -> bool:
     return True
 
 def deploy_user_configs(repo_dir: Path, is_update: bool = False):
-    """Развёртывание пользовательских конфигов (kitty, cava, fastfetch)."""
     configs = ["kitty", "cava", "fastfetch"]
     for c in configs:
         src = repo_dir / "config" / c
@@ -90,7 +82,6 @@ def deploy_user_configs(repo_dir: Path, is_update: bool = False):
             continue
 
         if not is_update or not tgt.exists():
-            # Если файл существует, делаем бэкап
             if tgt.exists():
                 BACKUP_BASE.mkdir(parents=True, exist_ok=True)
                 backup_dest = BACKUP_BASE / f"{c}_backup"
@@ -106,14 +97,12 @@ def deploy_user_configs(repo_dir: Path, is_update: bool = False):
             log_ok(f"Установлен конфиг: ~/.config/{c}")
 
 def deploy_fonts(repo_dir: Path):
-    """Проверка и установка шрифтов Iosevka Nerd Font."""
     font_user_dir = Path.home() / ".local/share/fonts/IosevkaNerdFont"
     if font_user_dir.exists() and any(font_user_dir.glob("*.ttf")):
         return
 
     log_info("Установка шрифтов Iosevka Nerd Font...")
     font_user_dir.mkdir(parents=True, exist_ok=True)
-    # Если в репозитории есть готовые шрифты или ссылки
     font_url = "https://github.com/ryanoasis/nerd-fonts/releases/latest/download/Iosevka.zip"
     zip_path = Path("/tmp/Iosevka.zip")
     ret, _, _ = run_cmd(["curl", "-fsSL", font_url, "-o", str(zip_path)])
@@ -124,7 +113,6 @@ def deploy_fonts(repo_dir: Path):
         log_ok("Шрифты Iosevka Nerd Font установлены.")
 
 def deploy_sddm_theme(repo_dir: Path, enable: bool = False):
-    """Установка темы SDDM Material You."""
     if not enable:
         return
 
@@ -136,7 +124,6 @@ def deploy_sddm_theme(repo_dir: Path, enable: bool = False):
     if sddm_src.exists():
         log_info("Установка темы SDDM Material You...")
         run_cmd(f"mkdir -p {sddm_target} && cp -a {sddm_src}/. {sddm_target}/", sudo=True)
-        # Настройка sddm.conf.d
         conf_d = Path("/etc/sddm.conf.d")
         run_cmd(f"mkdir -p {conf_d}", sudo=True)
         conf_content = "[Theme]\nCurrent=material-you\n"

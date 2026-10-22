@@ -30,7 +30,6 @@ WantedBy=timers.target
 UNIT_DIR = Path.home() / ".config/systemd/user"
 
 def enable_daemon() -> bool:
-    """Включение службы и таймера автообновления."""
     UNIT_DIR.mkdir(parents=True, exist_ok=True)
     linka_path = shutil.which("linka") or str(BIN_DIR / "linka")
 
@@ -51,13 +50,11 @@ def enable_daemon() -> bool:
         return False
 
 def disable_daemon() -> bool:
-    """Отключение службы и таймера автообновления."""
     run_cmd(["systemctl", "--user", "disable", "--now", "linka-auto.timer"])
     run_cmd(["systemctl", "--user", "stop", "linka-auto.service"])
     log_ok("Автообновления отключены.")
     return True
 
 def daemon_status():
-    """Проверка статуса таймера."""
     ret, out, _ = run_cmd(["systemctl", "--user", "status", "linka-auto.timer"], capture=True)
     print(out if out else "Служба не найдена.")

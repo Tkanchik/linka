@@ -18,7 +18,6 @@ from .deploy import deploy_core, deploy_user_configs, deploy_fonts
 from .hooks import run_post_update
 
 def ensure_repo(branch: str = DEFAULT_BRANCH) -> Optional[Path]:
-    """Клонирование или обновление локального git-кэша репозитория."""
     if not shutil.which("git"):
         log_error("git не установлен в системе.")
         return None
@@ -41,19 +40,16 @@ def ensure_repo(branch: str = DEFAULT_BRANCH) -> Optional[Path]:
     return CACHE_BASE
 
 def get_installed_commit() -> str:
-    """Определение текущего коммита установленной версии."""
     state_file = TARGET_BASE / ".serpantinum-commit"
     if state_file.exists():
         return state_file.read_text().strip()
     return ""
 
 def get_repo_commit(repo_dir: Path) -> str:
-    """Получение текущего коммита из git-репозитория."""
     ret, out, _ = run_cmd(["git", "rev-parse", "HEAD"], cwd=repo_dir, capture=True)
     return out.strip() if ret == 0 else ""
 
 def perform_update(force: bool = False, branch: str = DEFAULT_BRANCH) -> bool:
-    """Основной процесс проверки и наката обновлений."""
     repo = ensure_repo(branch=branch)
     if not repo:
         return False
@@ -67,30 +63,24 @@ def perform_update(force: bool = False, branch: str = DEFAULT_BRANCH) -> bool:
 
     log_info(f"Обновление: {current_commit[:7] if current_commit else 'неизвестно'} → {target_commit[:7]}")
 
-    # 1. Развёртывание ядра
     if not deploy_core(repo):
         return False
 
-    # 2. Обновление шрифтов
     deploy_fonts(repo)
 
-    # 3. Сохранение текущего коммита
     try:
         (TARGET_BASE / ".serpantinum-commit").write_text(target_commit)
     except Exception:
         pass
 
-    # 4. Запуск post-update хука
     run_post_update()
 
-    # 5. Перезапуск шелла при необходимости
     restart_shell_if_running()
 
     log_ok(f"Обновление до {target_commit[:7]} успешно завершено.")
     return True
 
 def restart_shell_if_running():
-    """Перезапуск Quickshell, если он запущен."""
     ret, out, _ = run_cmd(["pgrep", "-f", "quickshell"], capture=True)
     if ret != 0:
         ret, out, _ = run_cmd(["pgrep", "-f", "bin/serpantinumd"], capture=True)

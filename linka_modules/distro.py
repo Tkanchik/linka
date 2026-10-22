@@ -4,7 +4,6 @@ from typing import List, Optional
 from .common import log_info, log_ok, log_warn, log_error, run_cmd
 
 class DistroManager:
-    """Базовый класс управления пакетами дистрибутива."""
     name: str = "unknown"
 
     def is_pkg_installed(self, pkg: str) -> bool:
@@ -21,7 +20,6 @@ class GentooManager(DistroManager):
     name = "gentoo"
 
     def is_pkg_installed(self, pkg: str) -> bool:
-        # portageq has_version / <pkg> — штатный способ в Gentoo
         if shutil.which("portageq"):
             ret, _, _ = run_cmd(["portageq", "has_version", "/", pkg], capture=True)
             return ret == 0
@@ -66,7 +64,6 @@ class FedoraManager(DistroManager):
 
 
 def detect_distro() -> Optional[DistroManager]:
-    """Определение текущего дистрибутива по /etc/os-release."""
     os_release = Path("/etc/os-release")
     if not os_release.exists():
         return None

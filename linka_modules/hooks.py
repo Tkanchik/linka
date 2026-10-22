@@ -3,7 +3,6 @@ from pathlib import Path
 from .common import CONFIG_DIR, TARGET_BASE, log_info, log_ok, log_warn, run_cmd
 
 def run_post_update() -> bool:
-    """Выполнение пользовательского post-update хука."""
     hook_file = CONFIG_DIR / "hooks/post_update.sh"
     if not hook_file.exists():
         return True

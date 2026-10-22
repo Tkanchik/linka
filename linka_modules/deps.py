@@ -2,7 +2,6 @@ from typing import List, Dict
 from .common import log_info, log_ok, log_warn, log_error
 from .distro import DistroManager, GentooManager, FedoraManager
 
-# Списки базовых зависимостей
 GENTOO_BASE_PKGS = [
     "gui-apps/quickshell",
     "sys-apps/file",
@@ -60,7 +59,6 @@ def get_required_pkgs(distro: DistroManager, compositor: str = "niri") -> List[s
     return []
 
 def check_and_install_deps(distro: DistroManager, compositor: str = "niri") -> bool:
-    """Проверка и установка недостающих пакетов."""
     required = get_required_pkgs(distro, compositor)
     if not required:
         log_warn("Не удалось определить пакеты для вашего дистрибутива.")

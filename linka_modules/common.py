@@ -5,7 +5,6 @@ import subprocess
 from pathlib import Path
 from typing import List, Optional, Tuple, Union
 
-# Константы путей
 REPO_SLUG = os.environ.get("SERPANTINUM_SLUG", "ilyamiro/serpantinum")
 DEFAULT_BRANCH = os.environ.get("SERPANTINUM_BRANCH", "master")
 REPO_URL = f"https://github.com/{REPO_SLUG}.git"
@@ -17,7 +16,6 @@ STATE_DIR = Path(os.environ.get("QS_STATE_DIR", Path.home() / ".local/state/serp
 CACHE_BASE = Path(os.environ.get("CACHE_BASE", Path.home() / "serpantinum"))
 BACKUP_BASE = Path.home() / ".config/serpantinum-backups"
 
-# Цвета терминала
 USE_COLOR = sys.stdout.isatty()
 
 class Colors:
@@ -50,7 +48,6 @@ def run_cmd(
     env: Optional[dict] = None,
     sudo: bool = False,
 ) -> Tuple[int, str, str]:
-    """Безопасный запуск системных команд."""
     if isinstance(cmd, str):
         cmd_list = ["bash", "-c", cmd]
     else:

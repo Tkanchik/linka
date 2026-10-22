@@ -9,7 +9,6 @@ COMPOSITOR_DIRS = {
 }
 
 def deploy_compositor(repo_dir: Path, compositor: str = "niri", overwrite: bool = False) -> bool:
-    """Развёртывание конфигурации выбранного композитора."""
     src = repo_dir / "compositors" / compositor
     if not src.exists() and (repo_dir / "compositor" / compositor).exists():
         src = repo_dir / "compositor" / compositor
@@ -27,7 +26,6 @@ def deploy_compositor(repo_dir: Path, compositor: str = "niri", overwrite: bool 
         if not overwrite:
             log_info(f"Конфигурация {compositor} уже существует в {dst}, пропускаем (используйте переустановку для перезаписи).")
             return True
-        # Резервная копия перед перезаписью
         BACKUP_BASE.mkdir(parents=True, exist_ok=True)
         backup_path = BACKUP_BASE / f"{compositor}_backup"
         if backup_path.exists():
