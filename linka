@@ -4641,6 +4641,19 @@ linka_stage_shell() {
     fi
     if [[ -n "$OLD_COMMIT" && "$OLD_COMMIT" != unknown ]] && git -C "$repo" cat-file -e "${OLD_COMMIT}^{commit}" 2>/dev/null; then
         while IFS= read -r -d '' old; do
+            parent="${old%/*}"
+            prefix="$stage"
+            while [[ -n "$parent" ]]; do
+                part="${parent%%/*}"
+                [[ -n "$part" && "$part" != . && "$part" != .. && -d "$prefix/$part" && ! -L "$prefix/$part" ]] || break
+                prefix="$prefix/$part"
+                if [[ "$parent" == "$part" ]]; then
+                    parent=""
+                else
+                    parent="${parent#*/}"
+                fi
+            done
+            [[ -z "$parent" ]] || continue
             rm -rf -- "${stage:?}/$old" || return 1
         done < <(git -C "$repo" diff -z --name-only --no-renames --diff-filter=D "$OLD_COMMIT" HEAD -- bin src)
     fi
