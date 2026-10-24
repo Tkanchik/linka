@@ -2707,6 +2707,25 @@ fix_matugen_compat() {
         fi
     fi
 
+    if [[ -f "$cfg" && -f "$tpl/fastfetch.jsonc.template" ]] && ! grep -q '\[templates\.fastfetch\]' "$cfg"; then
+        cat >> "$cfg" <<EOF
+
+[templates.fastfetch]
+input_path = "$tpl/fastfetch.jsonc.template"
+output_path = "~/.config/fastfetch/config.jsonc"
+EOF
+    fi
+
+    local cfg_static="$TARGET_BASE/src/assets/matugen/config-static.toml"
+    if [[ -f "$cfg_static" && -f "$tpl/fastfetch.jsonc.template" ]] && ! grep -q '\[templates\.fastfetch\]' "$cfg_static"; then
+        cat >> "$cfg_static" <<EOF
+
+[templates.fastfetch]
+input_path = "templates/fastfetch.jsonc.template"
+output_path = "~/.config/fastfetch/config.jsonc"
+EOF
+    fi
+
     return 0
 }
 
