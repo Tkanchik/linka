@@ -2,7 +2,7 @@
 
 set -Eeuo pipefail
 
-readonly LINKA_VERSION="4.10.0"
+readonly LINKA_VERSION="4.11.0"
 readonly REPO_SLUG="ilyamiro/serpantinum"
 readonly WALLPAPER_REPO="https://github.com/ilyamiro/shell-wallpapers.git"
 readonly FONT_URL="https://github.com/ryanoasis/nerd-fonts/releases/latest/download/Iosevka.zip"
@@ -248,6 +248,7 @@ flow_install() {
         install_dependencies || return 1
     fi
 
+    install_shell_components "$PROJECT_ROOT" || return 1
     ensure_mango_compatible || return 1
 
     install_fonts || true
@@ -327,7 +328,10 @@ flow_update() {
     TARGET_VERSION="$(get_target_version "$PROJECT_ROOT")"
 
     if [[ "$OLD_COMMIT" == "$TARGET_COMMIT" && "$OLD_COMMIT" != unknown && "$FORCE_UPDATE" != 1 ]]; then
-        if selected_compositor_config_missing; then
+        if ! verify_shell_components "$PROJECT_ROOT" quiet; then
+            log_info 'Коммит не изменился, но компоненты Serpantinum требуют установки или обновления.'
+            FORCE_UPDATE=1
+        elif selected_compositor_config_missing; then
             log_info 'Для выбранного композитора ещё нет конфига — разворачиваю его.'
             FORCE_UPDATE=1
         elif selected_mango_needs_upgrade; then
@@ -355,6 +359,7 @@ flow_update() {
     log_info "Compositors: ${sel:-none}"
 
     linka_update_session_ready || return 1
+    install_shell_components "$PROJECT_ROOT" || return 1
 
     if [[ "$AUTO_MODE" != 1 ]]; then
         ensure_update_dependencies || return 1
@@ -1074,6 +1079,121 @@ check_quickshell() {
     fi
 
     return 0
+}
+
+shell_component_requirements() {
+    local repo="$1" component version metadata seen=" "
+    [[ -d "$repo" ]] || { log_error "Нет исходников для проверки компонентов: $repo"; return 1; }
+    if [[ -f "$repo/.linka-components" ]]; then
+        while read -r component version metadata || [[ -n "$component$version$metadata" ]]; do
+            [[ -n "$component" ]] || continue
+            case "$component" in core|audio|gamma) ;; *) return 1 ;; esac
+            [[ "$version" =~ ^[0-9]+(\.[0-9]+){1,3}$ && -z "$metadata" && "$seen" != *" $component "* ]] || return 1
+            seen+="$component "
+            printf '%s %s\n' "$component" "$version"
+        done < "$repo/.linka-components"
+        return 0
+    fi
+    for component in core audio gamma; do
+        metadata="$repo/nix/$component.nix"
+        if [[ -f "$metadata" ]]; then
+            version="$(sed -nE 's/.*version[[:space:]]*=[[:space:]]*"([0-9]+(\.[0-9]+){1,3})"[[:space:]]*;.*/\1/p' "$metadata")"
+            if [[ ! "$version" =~ ^[0-9]+(\.[0-9]+){1,3}$ ]]; then
+                log_error "Не удалось определить версию serpantinum-$component в $metadata"
+                return 1
+            fi
+            printf '%s %s\n' "$component" "$version"
+        elif grep -rqF -- "serpantinum-$component" "$repo/src" "$repo/bin" 2>/dev/null; then
+            log_error "Serpantinum использует serpantinum-$component, но не указывает его версию в nix/$component.nix"
+            return 1
+        fi
+    done
+}
+
+shell_component_version() {
+    local binary="$1" output
+    command -v "$binary" >/dev/null 2>&1 || return 1
+    output="$(timeout 10 "$binary" --version 2>/dev/null)" || return 1
+    if [[ "$output" =~ ^$binary\ ([0-9]+(\.[0-9]+){1,3})$ ]]; then
+        printf '%s\n' "${BASH_REMATCH[1]}"
+    else
+        return 1
+    fi
+}
+
+verify_shell_components() {
+    local repo="$1" quiet="${2:-}" requirements component required installed failed=0
+    local PATH="$BIN_DIR:$PATH"
+    requirements="$(shell_component_requirements "$repo")" || return 1
+    [[ -n "$requirements" ]] || return 0
+    while read -r component required; do
+        installed="$(shell_component_version "serpantinum-$component" || true)"
+        if [[ -n "$installed" ]] && version_ge "$installed" "$required"; then
+            [[ "$quiet" == quiet ]] || log_info "serpantinum-$component: $installed (требуется $required+)"
+        else
+            [[ "$quiet" == quiet ]] || log_error "Требуется serpantinum-$component $required+, установлено: ${installed:-отсутствует или не запускается}"
+            failed=1
+        fi
+    done <<< "$requirements"
+    return "$failed"
+}
+
+install_shell_component() (
+    local component="$1" version="$2" binary archive url work expected actual installed entry destination=''
+    case "$component" in core|audio|gamma) ;; *) log_error "Неизвестный компонент: $component"; return 1 ;; esac
+    [[ "$version" =~ ^[0-9]+(\.[0-9]+){1,3}$ ]] || return 1
+    if [[ "$(uname -m)" != x86_64 ]]; then
+        log_error "Для serpantinum-$component нет готовой сборки под $(uname -m); установите $version+ из исходников."
+        return 1
+    fi
+    for binary in curl sha256sum tar timeout; do require_command "$binary" || return 1; done
+    binary="serpantinum-$component"
+    archive="$binary-$version-x86_64-linux.tar.gz"
+    url="https://github.com/ilyamiro/$binary/releases/download/v$version"
+    work="$(mktemp -d "${TMPDIR:-/tmp}/linka-component.XXXXXXXX")" || return 1
+    trap 'rm -rf -- "$work"; [[ -z "$destination" ]] || rm -f -- "$destination"' EXIT
+    log_info "Устанавливаю $binary $version..."
+    curl --proto '=https' --proto-redir '=https' -fLsS --connect-timeout 15 --max-time 180 --retry 2 "$url/$archive" -o "$work/$archive" || return 1
+    curl --proto '=https' --proto-redir '=https' -fLsS --connect-timeout 15 --max-time 60 --retry 2 "$url/SHA256SUMS" -o "$work/SHA256SUMS" || return 1
+    expected="$(awk -v file="$archive" '$2 == file || $2 == "*" file {print $1}' "$work/SHA256SUMS")"
+    actual="$(sha256sum "$work/$archive")" || return 1
+    actual="${actual%% *}"
+    if [[ ! "$expected" =~ ^[a-fA-F0-9]{64}$ || "${expected,,}" != "$actual" ]]; then
+        log_error "$binary: контрольная сумма архива не совпадает или отсутствует."
+        return 1
+    fi
+    entry="$(tar -tvzf "$work/$archive" -- "usr/bin/$binary")" || return 1
+    [[ "$entry" == -* && "$entry" != *$'\n'* ]] || { log_error "$binary: архив не содержит единственный обычный исполняемый файл."; return 1; }
+    tar -xOzf "$work/$archive" -- "usr/bin/$binary" > "$work/$binary" || return 1
+    chmod 755 "$work/$binary" || return 1
+    installed="$(PATH="$work:$PATH" shell_component_version "$binary" || true)"
+    [[ "$installed" == "$version" ]] || { log_error "$binary: загруженная программа не запускается или сообщает другую версию."; return 1; }
+    mkdir -p -- "$BIN_DIR" || return 1
+    destination="$(mktemp "$BIN_DIR/.$binary.XXXXXXXX")" || return 1
+    install -m755 -- "$work/$binary" "$destination" || return 1
+    mv -fT -- "$destination" "$BIN_DIR/$binary" || return 1
+    destination=''
+    log_ok "$binary $version установлен в $BIN_DIR"
+)
+
+install_shell_components() {
+    local repo="$1" requirements component required installed
+    export PATH="$BIN_DIR:$PATH"
+    hash -r
+    requirements="$(shell_component_requirements "$repo")" || return 1
+    [[ -n "$requirements" ]] || return 0
+    while read -r component required; do
+        installed="$(shell_component_version "serpantinum-$component" || true)"
+        if [[ -z "$installed" ]] || ! version_ge "$installed" "$required"; then
+            if ! install_shell_component "$component" "$required"; then
+                FAILED_PKGS+=("serpantinum-$component>=$required")
+                log_error "Обязательный компонент не установлен: serpantinum-$component $required+. Обновление оболочки отменено."
+                return 1
+            fi
+            hash -r
+        fi
+    done <<< "$requirements"
+    verify_shell_components "$repo"
 }
 
 verify_required_dependencies() {
@@ -2436,6 +2556,8 @@ copy_tree_full() {
         cp -a "$repo/version.txt" "$TARGET_BASE/version.txt" 2>/dev/null || true
     fi
 
+    rm -f -- "$TARGET_BASE/.linka-components" || return 1
+    shell_component_requirements "$repo" > "$TARGET_BASE/.linka-components" || return 1
     return 0
 }
 
@@ -3892,7 +4014,8 @@ auto_shell_step() {
     TARGET_COMMIT="$(get_target_commit "$PROJECT_ROOT")"
     TARGET_VERSION="$(get_target_version "$PROJECT_ROOT")"
 
-    if [[ "$TARGET_COMMIT" == unknown || "$OLD_COMMIT" == "$TARGET_COMMIT" ]]; then
+    if [[ "$TARGET_COMMIT" == unknown ]] ||
+       { [[ "$OLD_COMMIT" == "$TARGET_COMMIT" ]] && verify_shell_components "$PROJECT_ROOT" quiet; }; then
         log_info "Serpantinum актуален ($OLD_VERSION, $OLD_COMMIT)."
         return 0
     fi
@@ -4693,6 +4816,8 @@ linka_stage_shell() {
     if [[ -f "$repo/version.txt" ]]; then
         cp -a --remove-destination -- "$repo/version.txt" "$stage/version.txt" || return 1
     fi
+    rm -f -- "$stage/.linka-components" || return 1
+    shell_component_requirements "$repo" > "$stage/.linka-components" || return 1
     if [[ ! -f "$stage/.serpantinum-managed" ]]; then
         printf 'owner=linka\nversion=%s\nrepo=%s\n' "$LINKA_VERSION" "$REPO_SLUG" > "$stage/.serpantinum-managed" || return 1
     fi
@@ -4933,6 +5058,14 @@ linka_doctor() {
         fi
     done
     if [[ "$installed_flag" == 1 ]]; then
+        local component_repo="${PROJECT_ROOT:-$CACHE_BASE}"
+        [[ ! -f "$TARGET_BASE/.linka-components" ]] || component_repo="$TARGET_BASE"
+        if [[ -d "$component_repo" ]]; then
+            verify_shell_components "$component_repo" || failed=1
+        else
+            log_error 'Нет локального кэша Serpantinum для проверки версий компонентов.'
+            failed=1
+        fi
         printf 'Коммит: %s\n' "$(state_get SHELL_COMMIT)"
     fi
     printf 'Бэкапы: %s\n' "$BACKUP_BASE"
