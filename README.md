@@ -1,8 +1,8 @@
 # linka
 
-`linka` устанавливает и обновляет [Serpantinum](https://github.com/ilyamiro/serpantinum) на Gentoo и Fedora. На Gentoo `linka` подключает оверлеи, устанавливает пакеты через Portage и выставляет нужные USE-флаги.
+`linka` устанавливает и обновляет [Serpantinum](https://github.com/ilyamiro/serpantinum) на Gentoo, Fedora, openSUSE (Tumbleweed/Slowroll) и Debian/Ubuntu (включая производные с Qt 6.6+, такие как Debian 13 Trixie/Sid и Ubuntu 24.10+). На Gentoo `linka` подключает оверлеи, устанавливает пакеты через Portage и выставляет нужные USE-флаги; на openSUSE и Debian/Ubuntu ставит доступные пакеты через `zypper` / `apt`, подтягивает `matugen`/`satty` из релизов GitHub и при отсутствии готового пакета собирает `quickshell` под установленный в системе Qt 6.
 
-Поддерживаются Niri, Hyprland, Sway и MangoWM. На Gentoo работают systemd и OpenRC.
+Поддерживаются Niri, Hyprland, Sway, MangoWM и Umbriel. На Gentoo работают systemd и OpenRC.
 
 ## Установка
 
@@ -78,7 +78,7 @@ linka auto daemon
 linka auto disable
 ```
 
-`--shell notify` только сообщает о новом коммите. `linka auto daemon` запускает цикл в текущем терминале; это пригодится, если композитор не запускает приложения из XDG autostart. Для системных пакетов доступны режимы `--system notify` и `--system apply`. На Fedora уведомления о пакетах работают без правила `sudoers`; для применения обновлений оно потребуется. На Gentoo правило нужно для обоих режимов. При включении `linka` создаёт `/etc/sudoers.d/linka-auto` с доступом без пароля только к нужным командам `dnf` или `emerge`. `linka auto disable` удаляет это правило.
+`--shell notify` только сообщает о новом коммите. `linka auto daemon` запускает цикл в текущем терминале; это пригодится, если композитор не запускает приложения из XDG autostart. Для системных пакетов доступны режимы `--system notify` и `--system apply`. На Fedora уведомления о пакетах работают без правила `sudoers`; для применения обновлений оно потребуется. На Gentoo, openSUSE и Debian/Ubuntu правило нужно для обоих режимов. При включении `linka` создаёт `/etc/sudoers.d/linka-auto` с доступом без пароля только к нужным командам `dnf`, `emerge`, `zypper` или `apt-get`. `linka auto disable` удаляет это правило.
 
 При разработке `linka` использовался ИИ.
 

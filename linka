@@ -2,7 +2,7 @@
 
 set -Eeuo pipefail
 
-readonly LINKA_VERSION="4.11.0"
+readonly LINKA_VERSION="4.12.0"
 readonly REPO_SLUG="ilyamiro/serpantinum"
 readonly WALLPAPER_REPO="https://github.com/ilyamiro/shell-wallpapers.git"
 readonly FONT_URL="https://github.com/ryanoasis/nerd-fonts/releases/latest/download/Iosevka.zip"
@@ -49,6 +49,10 @@ AUTO_AUTOSTART_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/autostart/linka-auto.desk
 AUTO_SUDOERS_FILE="/etc/sudoers.d/linka-auto"
 AUTO_SLEEP_PID=""
 AUTO_DNF_APPLY=(-y upgrade --refresh)
+AUTO_APT_UPDATE=(update -qq)
+AUTO_APT_APPLY=(-y --with-new-pkgs upgrade)
+AUTO_ZYPPER_REF=(--non-interactive refresh)
+AUTO_ZYPPER_APPLY=(--non-interactive dup --auto-agree-with-licenses)
 AUTO_EMERGE_SYNC=(--sync)
 AUTO_EMERGE_PRETEND=(--pretend --update --deep --newuse --with-bdeps=y @world)
 AUTO_EMERGE_APPLY=(--ask=n --quiet-build=y --update --deep --newuse --with-bdeps=y @world)
@@ -812,6 +816,14 @@ detect_distro_backend() {
             printf '%s\n' "$id"
             return 0
             ;;
+        debian|ubuntu|linuxmint|pop|neon|zorin|elementary|kali|parrot|pika|tuxedo)
+            printf 'debian\n'
+            return 0
+            ;;
+        opensuse-tumbleweed|opensuse-slowroll|opensuse|opensuse-leap|suse)
+            printf 'opensuse\n'
+            return 0
+            ;;
     esac
 
     case " $like " in
@@ -821,6 +833,14 @@ detect_distro_backend() {
             ;;
         *' gentoo '*)
             printf 'gentoo\n'
+            return 0
+            ;;
+        *' debian '*|*' ubuntu '*)
+            printf 'debian\n'
+            return 0
+            ;;
+        *' opensuse '*|*' suse '*)
+            printf 'opensuse\n'
             return 0
             ;;
     esac
@@ -846,6 +866,43 @@ init_package_lists() {
         SDDM_PKGS=(sddm qt6-qtdeclarative qt6-qtsvg sddm-wayland-generic adwaita-cursor-theme)
         OPTIONAL_PKGS=(matugen satty wl-gammarelay-rs cliphist)
         CORE_PKGS=(quickshell qt6-qtdeclarative qt6-qtmultimedia pipewire wireplumber)
+        BOOTSTRAP_TOOLS=(jq curl git unzip fc-list)
+        BOOTSTRAP_PKGS=(jq curl git unzip fontconfig)
+    elif [[ "$DISTRO" == 'opensuse' ]]; then
+        REQUIRED_PKGS=(
+            kitty cava zbar tesseract-ocr tesseract-ocr-traineddata-english pavucontrol alsa-utils
+            wl-clipboard fd ripgrep cliphist jq socat inotify-tools brightnessctl
+            ddcutil acpi iw bluez libnotify-tools NetworkManager sensors bc
+            pipewire wireplumber pipewire-pulseaudio pipewire-alsa pipewire-tools libpulse0 python3
+            ImageMagick wget curl file git psmisc ffmpeg fastfetch unzip python3-websockets
+            qt6-declarative-imports libQt6Multimedia6 libQt6MultimediaQuick6 qt6-websockets-imports
+            qt6-wayland-integration libQt6Svg6 qt6-shadertools qt6ct grim slurp playerctl
+            xdg-desktop-portal xdg-desktop-portal-gtk xdg-user-dirs xdg-utils wmctrl
+            easyeffects nautilus adwaita-icon-theme wf-recorder xwayland-satellite
+            jetbrains-mono-fonts fontawesome-fonts power-profiles-daemon
+        )
+        SDDM_PKGS=(sddm qt6-declarative-imports libQt6Svg6 adwaita-icon-theme)
+        OPTIONAL_PKGS=(pamixer adw-gtk3-theme matugen satty quickshell)
+        CORE_PKGS=(pipewire wireplumber libQt6Multimedia6 qt6-declarative-imports)
+        BOOTSTRAP_TOOLS=(jq curl git unzip fc-list)
+        BOOTSTRAP_PKGS=(jq curl git unzip fontconfig)
+    elif [[ "$DISTRO" == 'debian' ]]; then
+        REQUIRED_PKGS=(
+            kitty cava zbar-tools tesseract-ocr tesseract-ocr-eng pavucontrol alsa-utils
+            wl-clipboard fd-find ripgrep cliphist jq socat inotify-tools brightnessctl
+            ddcutil acpi iw bluez libnotify-bin network-manager lm-sensors bc
+            pipewire wireplumber pipewire-pulse pipewire-alsa python3
+            imagemagick wget curl file git psmisc ffmpeg unzip python3-websockets
+            qml6-module-qtwebsockets qml6-module-qtmultimedia qml6-module-qt5compat-graphicaleffects
+            qml6-module-qtqml qml6-module-qtquick qml6-module-qtquick-controls qml6-module-qtquick-layouts
+            qt6-wayland qt6-svg-plugins qt6ct grim slurp playerctl
+            xdg-desktop-portal xdg-desktop-portal-gtk xdg-user-dirs xdg-utils wmctrl
+            easyeffects nautilus adwaita-icon-theme wf-recorder fonts-jetbrains-mono fonts-font-awesome
+            power-profiles-daemon
+        )
+        SDDM_PKGS=(sddm qml6-module-qtqml qml6-module-qtquick qml6-module-qtquick-controls qml6-module-qtquick-layouts qt6-svg-plugins adwaita-icon-theme)
+        OPTIONAL_PKGS=(fastfetch pamixer xwayland-satellite adw-gtk3 matugen satty quickshell)
+        CORE_PKGS=(pipewire wireplumber qt6-wayland qml6-module-qtmultimedia qml6-module-qtquick)
         BOOTSTRAP_TOOLS=(jq curl git unzip fc-list)
         BOOTSTRAP_PKGS=(jq curl git unzip fontconfig)
     else
@@ -886,7 +943,7 @@ init_package_lists() {
 preflight() {
     DISTRO="$(detect_distro_backend)"
     if [[ -z "$DISTRO" ]]; then
-        log_error 'Только Fedora и Gentoo.'
+        log_error 'Поддерживаются только Gentoo, Fedora, openSUSE и Debian/Ubuntu.'
         exit 1
     fi
 
@@ -898,11 +955,21 @@ preflight() {
 pkg_installed() {
     local pkg="$1"
 
-    if [[ "$DISTRO" == 'fedora' ]]; then
+    if [[ "$DISTRO" == 'fedora' || "$DISTRO" == 'opensuse' ]]; then
         if rpm -q "$pkg" >/dev/null 2>&1; then
             return 0
         fi
         if rpm -q --whatprovides "$pkg" >/dev/null 2>&1; then
+            return 0
+        fi
+        if command -v "$pkg" >/dev/null 2>&1; then
+            return 0
+        fi
+        return 1
+    fi
+
+    if [[ "$DISTRO" == 'debian' ]]; then
+        if dpkg-query -W -f='${db:Status-Status}\n' "$pkg" 2>/dev/null | grep -qx 'installed'; then
             return 0
         fi
         if command -v "$pkg" >/dev/null 2>&1; then
@@ -946,6 +1013,18 @@ comp_atom() {
             sway)     printf 'sway\n' ;;
             mango)    printf 'mangowm\n' ;;
             umbriel)  printf 'umbriel-nightly\n' ;;
+            *)        printf '%s\n' "$1" ;;
+        esac
+        return 0
+    fi
+
+    if [[ "$DISTRO" == 'debian' || "$DISTRO" == 'opensuse' ]]; then
+        case "$c" in
+            hyprland) printf 'hyprland\n' ;;
+            niri)     printf 'niri\n' ;;
+            sway)     printf 'sway\n' ;;
+            mango)    printf 'mangowm\n' ;;
+            umbriel)  printf 'umbriel\n' ;;
             *)        printf '%s\n' "$1" ;;
         esac
         return 0
@@ -1010,6 +1089,11 @@ bootstrap_installer_deps() {
 
     if [[ "$DISTRO" == 'fedora' ]]; then
         run_root dnf install -y --skip-unavailable "${missing[@]}" || true
+    elif [[ "$DISTRO" == 'opensuse' ]]; then
+        run_root zypper --non-interactive install "${missing[@]}" || true
+    elif [[ "$DISTRO" == 'debian' ]]; then
+        run_root env DEBIAN_FRONTEND=noninteractive apt-get update -qq || true
+        run_root env DEBIAN_FRONTEND=noninteractive apt-get install -y "${missing[@]}" || true
     else
         run_root emerge --ask=n "${missing[@]}" || true
     fi
@@ -1033,7 +1117,11 @@ mango_version_ok() {
     fi
 
     local version=''
-    version="$(rpm -q --qf '%{VERSION}' mangowm 2>/dev/null || true)"
+    if [[ "$DISTRO" == debian ]]; then
+        version="$(dpkg-query -W -f='${Version}' mangowm 2>/dev/null | sed -E 's/^[0-9]+://; s/-.*$//' || true)"
+    else
+        version="$(rpm -q --qf '%{VERSION}' mangowm 2>/dev/null || true)"
+    fi
     if [[ -z "$version" ]] && command -v mango >/dev/null 2>&1; then
         version="$(mango --version 2>&1 | grep -m1 -oE '[0-9]+\.[0-9]+(\.[0-9]+)?' || true)"
     fi
@@ -1320,6 +1408,111 @@ install_dependencies() {
 
         if ! command -v fd >/dev/null 2>&1 && command -v fdfind >/dev/null 2>&1; then
             run_optional_root ln -sfn "$(command -v fdfind)" /usr/local/bin/fd || true
+        fi
+    elif [[ "$DISTRO" == 'opensuse' ]]; then
+        log_info 'openSUSE: обновляю метаданные zypper...'
+        run_root zypper --non-interactive refresh || log_warn 'openSUSE: zypper refresh завершился с предупреждениями'
+
+        local raw_list=("${REQUIRED_PKGS[@]}")
+        if [[ "$OPT_SDDM" == true && ${#SDDM_PKGS[@]} -gt 0 ]]; then
+            raw_list+=("${SDDM_PKGS[@]}")
+        fi
+
+        local avail_pkgs=()
+        mapfile -t avail_pkgs < <(opensuse_filter_pkgs "${raw_list[@]}")
+        target_list=("${avail_pkgs[@]}")
+
+        if [[ ${#target_list[@]} -gt 0 ]]; then
+            log_info "openSUSE: основные пакеты (${#target_list[@]})..."
+            run_root zypper --non-interactive install "${target_list[@]}" || log_warn 'openSUSE: основная транзакция zypper не полная'
+        fi
+
+        if [[ ${#OPTIONAL_PKGS[@]} -gt 0 ]]; then
+            local opt_avail=()
+            mapfile -t opt_avail < <(opensuse_filter_pkgs silent "${OPTIONAL_PKGS[@]}")
+            for pkg in "${opt_avail[@]}"; do
+                if ! pkg_installed "$pkg"; then
+                    run_root zypper --non-interactive install "$pkg" || log_warn "optional: $pkg не удалось установить из zypper"
+                fi
+            done
+        fi
+
+        debian_ensure_matugen || log_warn 'openSUSE: matugen не установлен'
+        debian_ensure_satty || log_warn 'openSUSE: satty не установлен'
+        opensuse_ensure_quickshell || log_warn 'openSUSE: quickshell не удалось установить или собрать'
+
+        if [[ ${#compositors[@]} -gt 0 ]]; then
+            for comp in "${compositors[@]}"; do
+                c="${comp,,}"
+                pkg="$(comp_atom "$c")"
+                if ! is_compositor_installed "$c" || { [[ "$c" == mango ]] && ! mango_version_ok; }; then
+                    if opensuse_pkg_available "$pkg"; then
+                        log_info "openSUSE: устанавливаю композитор $pkg..."
+                        if ! run_root zypper --non-interactive install "$pkg"; then
+                            log_warn "compositor: $pkg не удалось установить"
+                            FAILED_PKGS+=("$pkg")
+                        fi
+                    else
+                        log_warn "openSUSE: пакет $pkg отсутствует в подключённых репозиториях zypper — установите $c вручную (или подключите OBS X11:Wayland)."
+                        FAILED_PKGS+=("$pkg")
+                    fi
+                fi
+            done
+        fi
+    elif [[ "$DISTRO" == 'debian' ]]; then
+        log_info 'Debian/Ubuntu: обновляю индексы apt...'
+        run_root env DEBIAN_FRONTEND=noninteractive apt-get update -qq || log_warn 'Debian/Ubuntu: apt-get update завершился с предупреждениями'
+
+        local raw_list=("${REQUIRED_PKGS[@]}")
+        if [[ "$OPT_SDDM" == true && ${#SDDM_PKGS[@]} -gt 0 ]]; then
+            raw_list+=("${SDDM_PKGS[@]}")
+        fi
+
+        local avail_pkgs=()
+        mapfile -t avail_pkgs < <(debian_filter_pkgs "${raw_list[@]}")
+        target_list=("${avail_pkgs[@]}")
+
+        if [[ ${#target_list[@]} -gt 0 ]]; then
+            log_info "Debian/Ubuntu: основные пакеты (${#target_list[@]})..."
+            run_root env DEBIAN_FRONTEND=noninteractive apt-get install -y "${target_list[@]}" || log_warn 'Debian/Ubuntu: основная транзакция apt не полная'
+        fi
+
+        if [[ ${#OPTIONAL_PKGS[@]} -gt 0 ]]; then
+            local opt_avail=()
+            mapfile -t opt_avail < <(debian_filter_pkgs silent "${OPTIONAL_PKGS[@]}")
+            for pkg in "${opt_avail[@]}"; do
+                if ! pkg_installed "$pkg"; then
+                    run_root env DEBIAN_FRONTEND=noninteractive apt-get install -y "$pkg" || log_warn "optional: $pkg не удалось установить из apt"
+                fi
+            done
+        fi
+
+        debian_ensure_matugen || log_warn 'Debian/Ubuntu: matugen не установлен'
+        debian_ensure_satty || log_warn 'Debian/Ubuntu: satty не установлен'
+        debian_ensure_quickshell || log_warn 'Debian/Ubuntu: quickshell не удалось установить или собрать'
+
+        if [[ ${#compositors[@]} -gt 0 ]]; then
+            for comp in "${compositors[@]}"; do
+                c="${comp,,}"
+                pkg="$(comp_atom "$c")"
+                if ! is_compositor_installed "$c" || { [[ "$c" == mango ]] && ! mango_version_ok; }; then
+                    if debian_pkg_available "$pkg"; then
+                        log_info "Debian/Ubuntu: устанавливаю композитор $pkg..."
+                        if ! run_root env DEBIAN_FRONTEND=noninteractive apt-get install -y "$pkg"; then
+                            log_warn "compositor: $pkg не удалось установить"
+                            FAILED_PKGS+=("$pkg")
+                        fi
+                    else
+                        log_warn "Debian/Ubuntu: пакет $pkg отсутствует в подключённых репозиториях apt — установите $c вручную (или подключите свежий репозиторий/PPA)."
+                        FAILED_PKGS+=("$pkg")
+                    fi
+                fi
+            done
+        fi
+
+        if ! command -v fd >/dev/null 2>&1 && command -v fdfind >/dev/null 2>&1; then
+            mkdir -p "$BIN_DIR"
+            ln -sfn "$(command -v fdfind)" "$BIN_DIR/fd" || true
         fi
     else
         target_list=("${REQUIRED_PKGS[@]}")
@@ -1833,6 +2026,244 @@ fedora_enable_terra() {
         terra-release
 }
 
+debian_pkg_available() {
+    local pkg="$1" cand
+    cand="$(apt-cache policy "$pkg" 2>/dev/null | awk '/Candidate:/ {print $2; exit}')"
+    [[ -n "$cand" && "$cand" != '(none)' ]]
+}
+
+debian_filter_pkgs() {
+    local quiet=0
+    if [[ "${1:-}" == silent ]]; then
+        quiet=1
+        shift
+    fi
+    local pkg out=() miss=()
+    for pkg in "$@"; do
+        if debian_pkg_available "$pkg" || pkg_installed "$pkg"; then
+            out+=("$pkg")
+        else
+            miss+=("$pkg")
+        fi
+    done
+    if [[ "$quiet" -eq 0 && ${#miss[@]} -gt 0 ]]; then
+        log_warn "Debian/Ubuntu: пакеты отсутствуют в apt и пропущены: ${miss[*]}"
+    fi
+    if [[ ${#out[@]} -gt 0 ]]; then
+        printf '%s\n' "${out[@]}"
+    fi
+    return 0
+}
+
+debian_install_release_tarball() {
+    local url="$1" binary="$2" tmp found
+    tmp="$(mktemp -d "${TMPDIR:-/tmp}/linka-deb-bin.XXXXXXXX")" || return 1
+    mkdir -p "$BIN_DIR"
+    if curl --proto '=https' --proto-redir '=https' -fLsS --connect-timeout 15 --max-time 180 --retry 3 "$url" -o "$tmp/pkg.tar.gz" &&
+       tar -xzf "$tmp/pkg.tar.gz" -C "$tmp"; then
+        found="$(find "$tmp" -type f -name "$binary" | head -n1)"
+        if [[ -n "$found" ]]; then
+            chmod 0755 "$found"
+            if "$found" --version >/dev/null 2>&1; then
+                install -m 0755 "$found" "$BIN_DIR/$binary"
+                rm -rf -- "$tmp"
+                hash -r
+                return 0
+            fi
+        fi
+    fi
+    rm -rf -- "$tmp"
+    return 1
+}
+
+debian_ensure_matugen() {
+    local ver major url
+    if command -v matugen >/dev/null 2>&1; then
+        ver="$(matugen --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+(\.[0-9]+)?' | head -n1 || true)"
+        major="${ver%%.*}"
+        if [[ "$major" =~ ^[0-9]+$ && "$major" -ge 4 ]]; then
+            return 0
+        fi
+    fi
+    [[ "$(uname -m)" == x86_64 ]] || return 1
+    log_info 'Загружаю matugen из GitHub Releases...'
+    url="$(curl --proto '=https' --proto-redir '=https' -fsSL --connect-timeout 15 --retry 2 'https://api.github.com/repos/InioX/matugen/releases/latest' 2>/dev/null | jq -r '[.assets[] | select(.name | test("x86_64\\.tar\\.gz$"))][0].browser_download_url // empty' 2>/dev/null || true)"
+    [[ -n "$url" ]] || url="https://github.com/InioX/matugen/releases/download/v4.2.0/matugen-4.2.0-x86_64.tar.gz"
+    debian_install_release_tarball "$url" matugen
+}
+
+debian_ensure_satty() {
+    command -v satty >/dev/null 2>&1 && return 0
+    local arch_pat="" url=""
+    case "$(uname -m)" in
+        x86_64)  arch_pat="x86_64-unknown-linux-gnu\\.tar\\.gz$" ;;
+        aarch64) arch_pat="aarch64-unknown-linux-gnu\\.tar\\.gz$" ;;
+        *)       return 1 ;;
+    esac
+    log_info 'Загружаю satty из GitHub Releases...'
+    url="$(curl --proto '=https' --proto-redir '=https' -fsSL --connect-timeout 15 --retry 2 'https://api.github.com/repos/gabm/Satty/releases/latest' 2>/dev/null | jq -r --arg p "$arch_pat" '[.assets[] | select(.name | test($p))][0].browser_download_url // empty' 2>/dev/null || true)"
+    [[ -n "$url" ]] || return 1
+    debian_install_release_tarball "$url" satty
+}
+
+opensuse_pkg_available() {
+    local pkg="$1"
+    zypper --non-interactive --quiet se -x "$pkg" >/dev/null 2>&1
+}
+
+opensuse_filter_pkgs() {
+    local quiet=0
+    if [[ "${1:-}" == silent ]]; then
+        quiet=1
+        shift
+    fi
+    if [[ $# -eq 0 ]]; then
+        return 0
+    fi
+    local pkg out=() miss=() found_names=" "
+    local zout=""
+    zout="$(zypper --non-interactive --quiet se -x "$@" 2>/dev/null || true)"
+    if [[ -n "$zout" ]]; then
+        while IFS= read -r pkg; do
+            [[ -n "$pkg" ]] && found_names+="$pkg "
+        done < <(awk -F'|' 'NF>=2 {gsub(/^[[:space:]]+|[[:space:]]+$/, "", $2); if ($2 != "" && $2 != "Name") print $2}' <<< "$zout")
+    fi
+    for pkg in "$@"; do
+        if [[ "$found_names" == *" $pkg "* ]] || pkg_installed "$pkg"; then
+            out+=("$pkg")
+        else
+            miss+=("$pkg")
+        fi
+    done
+    if [[ "$quiet" -eq 0 && ${#miss[@]} -gt 0 ]]; then
+        log_warn "openSUSE: пакеты отсутствуют в zypper и пропущены: ${miss[*]}"
+    fi
+    if [[ ${#out[@]} -gt 0 ]]; then
+        printf '%s\n' "${out[@]}"
+    fi
+    return 0
+}
+
+opensuse_ensure_quickshell() {
+    local ver
+    if command -v quickshell >/dev/null 2>&1; then
+        ver="$(quickshell_version)"
+        if [[ -n "$ver" ]] && version_ge "$ver" "$QUICKSHELL_MIN_VERSION"; then
+            return 0
+        fi
+    fi
+
+    local build_deps=(
+        gcc-c++ cmake ninja pkgconf-pkg-config git spirv-tools vulkan-headers
+        wayland-protocols-devel wayland-devel qt6-base-devel qt6-base-private-devel
+        qt6-declarative-devel qt6-declarative-private-devel qt6-wayland-devel
+        qt6-wayland-private-devel qt6-shadertools-devel qt6-svg-devel cli11-devel
+        libdrm-devel libgbm-devel pipewire-devel pam-devel
+        polkit-devel glib2-devel jemalloc-devel libxcb-devel
+    )
+    local avail_bdeps=()
+    mapfile -t avail_bdeps < <(opensuse_filter_pkgs "${build_deps[@]}")
+    if [[ ${#avail_bdeps[@]} -gt 0 ]]; then
+        log_info 'openSUSE: ставлю сборочные зависимости для Quickshell...'
+        run_root zypper --non-interactive install "${avail_bdeps[@]}" || return 1
+    fi
+
+    local qt_ver=""
+    qt_ver="$(pkg-config --modversion Qt6Core 2>/dev/null || true)"
+    if [[ -n "$qt_ver" ]] && ! version_ge "$qt_ver" 6.6; then
+        log_error "openSUSE: обнаружен Qt $qt_ver, но для Quickshell требуется Qt 6.6+ (openSUSE Tumbleweed или Slowroll)."
+        return 1
+    fi
+
+    local tag="" work="" jobs=2
+    tag="$(curl --proto '=https' --proto-redir '=https' -fsSL --connect-timeout 15 --retry 2 'https://api.github.com/repos/quickshell-mirror/quickshell/releases/latest' 2>/dev/null | jq -r '.tag_name // empty' 2>/dev/null || true)"
+    [[ -n "$tag" ]] || tag="v0.3.2"
+    if command -v nproc >/dev/null 2>&1; then
+        jobs="$(nproc)"
+        (( jobs > 6 )) && jobs=6
+    fi
+
+    work="$(mktemp -d "${TMPDIR:-/tmp}/linka-qs-build.XXXXXXXX")" || return 1
+    log_info "openSUSE: собираю Quickshell ($tag) под системный Qt ${qt_ver:-6}..."
+    if git clone --depth 1 --branch "$tag" https://github.com/quickshell-mirror/quickshell.git "$work/src" &&
+       cmake -GNinja -S "$work/src" -B "$work/build" \
+           -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+           -DCMAKE_INSTALL_PREFIX="$HOME/.local" \
+           -DDISTRIBUTOR="linka (openSUSE source build)" \
+           -DCRASH_HANDLER=OFF &&
+       cmake --build "$work/build" -j "$jobs" &&
+       cmake --install "$work/build"; then
+        rm -rf -- "$work"
+        hash -r
+        ver="$(quickshell_version)"
+        [[ -n "$ver" ]] && version_ge "$ver" "$QUICKSHELL_MIN_VERSION"
+        return $?
+    fi
+
+    rm -rf -- "$work"
+    return 1
+}
+
+debian_ensure_quickshell() {
+    local ver
+    if command -v quickshell >/dev/null 2>&1; then
+        ver="$(quickshell_version)"
+        if [[ -n "$ver" ]] && version_ge "$ver" "$QUICKSHELL_MIN_VERSION"; then
+            return 0
+        fi
+    fi
+
+    local build_deps=(
+        build-essential cmake ninja-build pkg-config git spirv-tools vulkan-headers
+        wayland-protocols libwayland-dev qt6-base-dev qt6-base-private-dev
+        qt6-declarative-dev qt6-declarative-private-dev qt6-wayland-dev
+        qt6-wayland-private-dev qt6-shadertools-dev libqt6svg6-dev libcli11-dev
+        libdrm-dev libgbm-dev libpipewire-0.3-dev libpam0g-dev
+        libpolkit-agent-1-dev libglib2.0-dev libjemalloc-dev libxcb1-dev
+    )
+    local avail_bdeps=()
+    mapfile -t avail_bdeps < <(debian_filter_pkgs "${build_deps[@]}")
+    if [[ ${#avail_bdeps[@]} -gt 0 ]]; then
+        log_info 'Debian/Ubuntu: ставлю сборочные зависимости для Quickshell...'
+        run_root env DEBIAN_FRONTEND=noninteractive apt-get install -y "${avail_bdeps[@]}" || return 1
+    fi
+
+    local qt_ver=""
+    qt_ver="$(pkg-config --modversion Qt6Core 2>/dev/null || true)"
+    if [[ -n "$qt_ver" ]] && ! version_ge "$qt_ver" 6.6; then
+        log_error "Debian/Ubuntu: обнаружен Qt $qt_ver, но для Quickshell требуется Qt 6.6+ (Debian 13 Trixie/Sid или Ubuntu 24.10+)."
+        return 1
+    fi
+
+    local tag="" work="" jobs=2
+    tag="$(curl --proto '=https' --proto-redir '=https' -fsSL --connect-timeout 15 --retry 2 'https://api.github.com/repos/quickshell-mirror/quickshell/releases/latest' 2>/dev/null | jq -r '.tag_name // empty' 2>/dev/null || true)"
+    [[ -n "$tag" ]] || tag="v0.3.2"
+    if command -v nproc >/dev/null 2>&1; then
+        jobs="$(nproc)"
+        (( jobs > 6 )) && jobs=6
+    fi
+
+    work="$(mktemp -d "${TMPDIR:-/tmp}/linka-qs-build.XXXXXXXX")" || return 1
+    log_info "Debian/Ubuntu: собираю Quickshell ($tag) под системный Qt ${qt_ver:-6}..."
+    if git clone --depth 1 --branch "$tag" https://github.com/quickshell-mirror/quickshell.git "$work/src" &&
+       cmake -GNinja -S "$work/src" -B "$work/build" \
+           -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+           -DCMAKE_INSTALL_PREFIX="$HOME/.local" \
+           -DDISTRIBUTOR="linka (Debian/Ubuntu source build)" \
+           -DCRASH_HANDLER=OFF &&
+       cmake --build "$work/build" -j "$jobs" &&
+       cmake --install "$work/build"; then
+        rm -rf -- "$work"
+        hash -r
+        ver="$(quickshell_version)"
+        [[ -n "$ver" ]] && version_ge "$ver" "$QUICKSHELL_MIN_VERSION"
+        return $?
+    fi
+
+    rm -rf -- "$work"
+    return 1
+}
+
 find_serpantinumd() {
     local cand
 
@@ -2268,6 +2699,44 @@ ensure_sddm_package() {
         fi
 
         run_root dnf install -y "${missing[@]}" || return 1
+    elif [[ "$DISTRO" == opensuse ]]; then
+        local pkgs=("${SDDM_PKGS[@]}")
+        if [[ ${#pkgs[@]} -eq 0 ]]; then
+            pkgs=(sddm qt6-declarative-imports libQt6Svg6)
+        fi
+        pkgs+=(rsync)
+        local avail=() missing=() pkg
+        mapfile -t avail < <(opensuse_filter_pkgs "${pkgs[@]}")
+        for pkg in "${avail[@]}"; do
+            if ! pkg_installed "$pkg"; then
+                missing+=("$pkg")
+            fi
+        done
+
+        if [[ ${#missing[@]} -eq 0 ]]; then
+            return 0
+        fi
+
+        run_root zypper --non-interactive install "${missing[@]}" || return 1
+    elif [[ "$DISTRO" == debian ]]; then
+        local pkgs=("${SDDM_PKGS[@]}")
+        if [[ ${#pkgs[@]} -eq 0 ]]; then
+            pkgs=(sddm qml6-module-qtqml qml6-module-qtquick qt6-svg-plugins)
+        fi
+        pkgs+=(rsync)
+        local avail=() missing=() pkg
+        mapfile -t avail < <(debian_filter_pkgs "${pkgs[@]}")
+        for pkg in "${avail[@]}"; do
+            if ! pkg_installed "$pkg"; then
+                missing+=("$pkg")
+            fi
+        done
+
+        if [[ ${#missing[@]} -eq 0 ]]; then
+            return 0
+        fi
+
+        run_root env DEBIAN_FRONTEND=noninteractive apt-get install -y "${missing[@]}" || return 1
     else
         local sddm_atoms=(gui-apps/sddm gui-apps/sddm-gentoo-config dev-qt/qtdeclarative dev-qt/qtsvg net-misc/rsync)
         if [[ "$(detect_init_system)" == openrc ]]; then
@@ -3354,6 +3823,18 @@ show_package_overview() {
         if [[ ${#filtered[@]} -gt 0 && -n "${filtered[0]}" ]]; then
             target_list=("${filtered[@]}")
         fi
+    elif [[ "$DISTRO" == "debian" ]]; then
+        local filtered=()
+        mapfile -t filtered < <(debian_filter_pkgs silent "${target_list[@]}")
+        if [[ ${#filtered[@]} -gt 0 && -n "${filtered[0]}" ]]; then
+            target_list=("${filtered[@]}")
+        fi
+    elif [[ "$DISTRO" == "opensuse" ]]; then
+        local filtered=()
+        mapfile -t filtered < <(opensuse_filter_pkgs silent "${target_list[@]}")
+        if [[ ${#filtered[@]} -gt 0 && -n "${filtered[0]}" ]]; then
+            target_list=("${filtered[@]}")
+        fi
     fi
 
     local overview_items=()
@@ -3623,7 +4104,7 @@ run_installer_ui() {
 
 usage() {
     cat <<EOF_USAGE
-linka ${LINKA_VERSION} — Serpantinum installer (Fedora/Gentoo)
+linka ${LINKA_VERSION} — Serpantinum installer (Gentoo/Fedora/openSUSE/Debian/Ubuntu)
 
   linka                       меню
   linka install               установка (поверх существующей — без затирания конфигов)
@@ -3645,7 +4126,7 @@ linka ${LINKA_VERSION} — Serpantinum installer (Fedora/Gentoo)
 
   Опции auto enable:
     --shell apply|notify|off  Serpantinum: обновлять сам / только уведомлять / не трогать (apply)
-    --system off|notify|apply пакеты ОС (dnf / emerge): не трогать / уведомлять / обновлять (off)
+    --system off|notify|apply пакеты ОС (dnf / emerge / zypper / apt): не трогать / уведомлять / обновлять (off)
     --interval МИНУТЫ         как часто проверять (15)
     --every-days ДНИ          как часто трогать пакеты ОС (1)
     --no-notify               без уведомлений
@@ -4163,6 +4644,22 @@ auto_privileged_commands() {
                 printf '%s %s\n' "$bin" "${AUTO_DNF_APPLY[*]}"
             fi
         fi
+    elif [[ "$DISTRO" == opensuse ]]; then
+        bin="$(command -v zypper 2>/dev/null || true)"
+        if [[ -n "$bin" ]]; then
+            printf '%s %s\n' "$bin" "${AUTO_ZYPPER_REF[*]}"
+            if [[ "$mode" == apply ]]; then
+                printf '%s %s\n' "$bin" "${AUTO_ZYPPER_APPLY[*]}"
+            fi
+        fi
+    elif [[ "$DISTRO" == debian ]]; then
+        bin="$(command -v apt-get 2>/dev/null || true)"
+        if [[ -n "$bin" ]]; then
+            printf '%s %s\n' "$bin" "${AUTO_APT_UPDATE[*]}"
+            if [[ "$mode" == apply ]]; then
+                printf '%s %s\n' "$bin" "${AUTO_APT_APPLY[*]}"
+            fi
+        fi
     else
         bin="$(command -v emerge 2>/dev/null || true)"
         if [[ -n "$bin" ]]; then
@@ -4256,6 +4753,18 @@ auto_install_sudoers() {
 }
 
 auto_reboot_hint() {
+    if [[ "$DISTRO" == debian ]]; then
+        [[ -f /var/run/reboot-required ]]
+        return $?
+    fi
+    if [[ "$DISTRO" == opensuse ]]; then
+        local zbin rc=0
+        zbin="$(command -v zypper 2>/dev/null || true)"
+        [[ -n "$zbin" ]] || return 1
+        "$zbin" --non-interactive needs-rebooting >/dev/null 2>&1 || rc=$?
+        [[ "$rc" -eq 102 ]]
+        return $?
+    fi
     local out bin
     bin="$(command -v dnf 2>/dev/null || command -v dnf5 2>/dev/null || true)"
     if [[ -z "$bin" ]]; then
@@ -4263,6 +4772,116 @@ auto_reboot_hint() {
     fi
     out="$("$bin" needs-restarting -r 2>&1 || true)"
     grep -qi 'reboot is required' <<< "$out"
+}
+
+auto_system_opensuse() {
+    local mode="$1" bin out="" n=0
+
+    bin="$(command -v zypper 2>/dev/null || true)"
+    if [[ -z "$bin" ]]; then
+        log_warn 'Система: zypper не найден.'
+        return 0
+    fi
+
+    if ! auto_sudo_ok "$mode"; then
+        log_warn "Система: sudo просит пароль. Выполните: linka auto enable --system $mode"
+        auto_notify 'Обновление системы не выполнено' "sudo просит пароль: linka auto enable --system $mode" critical
+        return 0
+    fi
+
+    log_info 'Система: zypper refresh...'
+    if ! run_root "$bin" "${AUTO_ZYPPER_REF[@]}" >/dev/null 2>&1; then
+        log_warn 'Система: zypper refresh не удался.'
+        return 0
+    fi
+
+    out="$("$bin" --non-interactive --quiet list-updates 2>/dev/null || true)"
+    n="$(awk -F'|' 'NF>=3 && $1 ~ /v/ {c++} END {print c+0}' <<< "$out")"
+
+    if [[ "$n" -eq 0 ]]; then
+        log_info 'Система: обновлений нет.'
+        auto_set AUTO_LAST_SYSTEM "$(date +%s)"
+        return 0
+    fi
+
+    if [[ "$mode" == notify ]]; then
+        log_info "Система: пакетов к обновлению — $n (режим notify)."
+        auto_notify 'Обновления системы' "Пакетов к обновлению: $n. Применить: sudo zypper dup"
+        auto_set AUTO_LAST_SYSTEM "$(date +%s)"
+        return 0
+    fi
+
+    log_info "Система: zypper dup ($n)..."
+    if run_root "$bin" "${AUTO_ZYPPER_APPLY[@]}"; then
+        auto_set AUTO_LAST_SYSTEM "$(date +%s)"
+        if auto_reboot_hint; then
+            log_ok 'Система обновлена, нужна перезагрузка.'
+            auto_notify 'Система обновлена' 'Нужна перезагрузка, чтобы применить обновления ядра/библиотек.'
+        else
+            log_ok 'Система обновлена.'
+            auto_notify 'Система обновлена' "Обновлено пакетов: $n."
+        fi
+    else
+        log_warn 'Система: zypper dup завершился с ошибкой.'
+        auto_notify 'Обновление системы не удалось' "Подробности: $AUTO_LOG" critical
+    fi
+
+    return 0
+}
+
+auto_system_debian() {
+    local mode="$1" bin out="" n=0
+
+    bin="$(command -v apt-get 2>/dev/null || true)"
+    if [[ -z "$bin" ]]; then
+        log_warn 'Система: apt-get не найден.'
+        return 0
+    fi
+
+    if ! auto_sudo_ok "$mode"; then
+        log_warn "Система: sudo просит пароль. Выполните: linka auto enable --system $mode"
+        auto_notify 'Обновление системы не выполнено' "sudo просит пароль: linka auto enable --system $mode" critical
+        return 0
+    fi
+
+    log_info 'Система: apt-get update...'
+    if ! run_root "$bin" "${AUTO_APT_UPDATE[@]}" >/dev/null 2>&1; then
+        log_warn 'Система: apt-get update не удался.'
+        return 0
+    fi
+
+    out="$("$bin" -s upgrade 2>/dev/null || true)"
+    n="$(printf '%s\n' "$out" | grep -c '^Inst ' || true)"
+
+    if [[ "$n" -eq 0 ]]; then
+        log_info 'Система: обновлений нет.'
+        auto_set AUTO_LAST_SYSTEM "$(date +%s)"
+        return 0
+    fi
+
+    if [[ "$mode" == notify ]]; then
+        log_info "Система: пакетов к обновлению — $n (режим notify)."
+        auto_notify 'Обновления системы' "Пакетов к обновлению: $n. Применить: sudo apt upgrade"
+        auto_set AUTO_LAST_SYSTEM "$(date +%s)"
+        return 0
+    fi
+
+    log_info "Система: apt-get upgrade ($n)..."
+    if run_root "$bin" "${AUTO_APT_APPLY[@]}"; then
+        auto_set AUTO_LAST_SYSTEM "$(date +%s)"
+        if auto_reboot_hint; then
+            log_ok 'Система обновлена, нужна перезагрузка.'
+            auto_notify 'Система обновлена' 'Нужна перезагрузка, чтобы применить обновления ядра/библиотек.'
+        else
+            log_ok 'Система обновлена.'
+            auto_notify 'Система обновлена' "Обновлено пакетов: $n."
+        fi
+    else
+        log_warn 'Система: apt-get upgrade завершился с ошибкой.'
+        auto_notify 'Обновление системы не удалось' "Подробности: $AUTO_LOG" critical
+    fi
+
+    return 0
 }
 
 auto_system_fedora() {
@@ -4399,6 +5018,10 @@ auto_system_step() {
 
     if [[ "$DISTRO" == fedora ]]; then
         auto_system_fedora "$mode"
+    elif [[ "$DISTRO" == opensuse ]]; then
+        auto_system_opensuse "$mode"
+    elif [[ "$DISTRO" == debian ]]; then
+        auto_system_debian "$mode"
     else
         auto_system_gentoo "$mode"
     fi

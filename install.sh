@@ -6,7 +6,7 @@ SHARE_DIR="${HOME}/.local/share/linka"
 BIN_DIR="${HOME}/.local/bin"
 LINKA_SYMLINK="${BIN_DIR}/linka"
 
-echo -e "\033[1;36m==>\033[0m \033[1mРазвёртывание linka (Gentoo/Fedora установщик для Serpantinum)...\033[0m"
+echo -e "\033[1;36m==>\033[0m \033[1mРазвёртывание linka (Gentoo/Fedora/openSUSE/Debian/Ubuntu установщик для Serpantinum)...\033[0m"
 
 if ! command -v git &>/dev/null; then
     echo -e "\033[1;33m[вним]\033[0m git не найден в системе. Пожалуйста, установите git и запустите снова."
