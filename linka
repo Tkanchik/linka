@@ -2,7 +2,7 @@
 
 set -Eeuo pipefail
 
-readonly LINKA_VERSION="4.12.0"
+readonly LINKA_VERSION="4.13.0"
 readonly REPO_SLUG="ilyamiro/serpantinum"
 readonly WALLPAPER_REPO="https://github.com/ilyamiro/shell-wallpapers.git"
 readonly FONT_URL="https://github.com/ryanoasis/nerd-fonts/releases/latest/download/Iosevka.zip"
@@ -2398,7 +2398,7 @@ start_shell() {
         local v
         for v in WAYLAND_DISPLAY DISPLAY XDG_RUNTIME_DIR XDG_CURRENT_DESKTOP XDG_SESSION_TYPE \
                  DESKTOP_SESSION DBUS_SESSION_BUS_ADDRESS HYPRLAND_INSTANCE_SIGNATURE SWAYSOCK \
-                 NIRI_SOCKET MANGO_INSTANCE_SIGNATURE QT_QPA_PLATFORM PATH; do
+                 NIRI_SOCKET MANGO_INSTANCE_SIGNATURE UMBRIEL_SOCKET QT_QPA_PLATFORM PATH; do
             if [[ -n "${!v:-}" ]]; then
                 env_args+=(--setenv="$v=${!v}")
             fi
@@ -3804,7 +3804,7 @@ EOF
     printf "\033[K%sЦП:%s %-35s | %sГП:%s %s\n" "$BOLD" "$RESET" "$cpu_info" "$BOLD" "$RESET" "$gpu_info"
     printf "\033[K%s--------------------------------------------------------------------------------%s\n" "$C_BLUE" "$RESET"
     printf "\033[K%sЦелевая версия:%s %-10s (%-7s) | %sРежим установки:%s %s\n" "$BOLD" "$RESET" "$target_ver" "$short_commit" "$BOLD" "$RESET" "$install_mode"
-    printf "\033[K[d] Диагностика   [r] Откат\n"
+    printf "\033[K[d] Диагностика   [f] Автолечение   [r] Откат\n"
     printf "\033[K%s================================================================================%s\n\n" "$C_BLUE" "$RESET"
 }
 
@@ -4112,7 +4112,9 @@ linka ${LINKA_VERSION} — Serpantinum installer (Gentoo/Fedora/openSUSE/Debian/
   linka update                обновление
   linka update --force        принудительное обновление поверх текущего коммита
   linka rollback              откат файлов оболочки и настроек (без пакетов ОС)
-  linka doctor                диагностика без изменений
+  linka doctor                диагностика установки и живой сессии без изменений
+  linka doctor --fix          автолечение сессии (порталы, звук, симлинки, дубликаты Quickshell)
+  linka repair                синоним linka doctor --fix
   linka update --dry-run       план действий без изменений (также install, reinstall, remove, rollback)
   linka remove                удаление
   linka kill                  остановка
@@ -4380,6 +4382,14 @@ linka_main_menu() {
                 [dD])
                     cleanup_terminal
                     linka_doctor || true
+                    read -r -p 'Нажмите Enter для продолжения...' _ || true
+                    stty -echo icanon 2>/dev/null || true
+                    printf "\e[?25l" 2>/dev/null || true
+                    break
+                    ;;
+                [fF])
+                    cleanup_terminal
+                    linka_repair_session || true
                     read -r -p 'Нажмите Enter для продолжения...' _ || true
                     stty -echo icanon 2>/dev/null || true
                     printf "\e[?25l" 2>/dev/null || true
@@ -5684,13 +5694,151 @@ linka_rollback() {
     log_ok 'Файлы оболочки и настройки восстановлены. Пакеты ОС не изменялись.'
 }
 
+doctor_find_compositor_pid() {
+    local c pid
+    for c in niri Hyprland hyprland sway mango umbriel; do
+        pid="$(pgrep -u "$UID" -x "$c" 2>/dev/null | head -n1 || true)"
+        if [[ -n "$pid" && -r "/proc/$pid/environ" ]]; then
+            printf '%s\n' "$pid"
+            return 0
+        fi
+    done
+    return 1
+}
+
+doctor_read_proc_var() {
+    local pid="$1" key="$2"
+    [[ -n "$pid" && -r "/proc/$pid/environ" ]] || return 1
+    tr '\0' '\n' < "/proc/$pid/environ" 2>/dev/null | sed -n "s/^${key}=//p" | head -n1
+}
+
+doctor_portal_env_status() {
+    local comp_pid="" want_wl="" want_disp="" sys_env="" sys_wl="" sys_disp="" portal_pid="" p_wl="" p_disp=""
+    comp_pid="$(doctor_find_compositor_pid || true)"
+    if [[ -n "$comp_pid" ]]; then
+        want_wl="$(doctor_read_proc_var "$comp_pid" WAYLAND_DISPLAY || true)"
+        want_disp="$(doctor_read_proc_var "$comp_pid" DISPLAY || true)"
+    fi
+    [[ -n "$want_wl" ]] || want_wl="${WAYLAND_DISPLAY:-}"
+    [[ -n "$want_disp" ]] || want_disp="${DISPLAY:-}"
+    if [[ -z "$want_wl" ]]; then
+        printf 'inactive\n'
+        return 0
+    fi
+
+    if command -v systemctl >/dev/null 2>&1 && systemctl --user show-environment >/dev/null 2>&1; then
+        sys_env="$(systemctl --user show-environment 2>/dev/null || true)"
+        sys_wl="$(sed -n 's/^WAYLAND_DISPLAY=//p' <<< "$sys_env" | head -n1)"
+        sys_disp="$(sed -n 's/^DISPLAY=//p' <<< "$sys_env" | head -n1)"
+        if [[ "$sys_wl" != "$want_wl" ]]; then
+            printf 'systemd-env:%s!=%s\n' "${sys_wl:-none}" "$want_wl"
+            return 1
+        fi
+        if [[ -n "$want_disp" && "$sys_disp" != "$want_disp" ]]; then
+            printf 'systemd-display:%s!=%s\n' "${sys_disp:-none}" "$want_disp"
+            return 1
+        fi
+    fi
+
+    portal_pid="$(pgrep -u "$UID" -x xdg-desktop-portal 2>/dev/null | head -n1 || true)"
+    if [[ -n "$portal_pid" && -r "/proc/$portal_pid/environ" ]]; then
+        p_wl="$(doctor_read_proc_var "$portal_pid" WAYLAND_DISPLAY || true)"
+        p_disp="$(doctor_read_proc_var "$portal_pid" DISPLAY || true)"
+        if [[ "$p_wl" != "$want_wl" ]]; then
+            printf 'portal-wayland:%s!=%s\n' "${p_wl:-none}" "$want_wl"
+            return 1
+        fi
+        if [[ -n "$want_disp" && "$p_disp" != "$want_disp" ]]; then
+            printf 'portal-display:%s!=%s\n' "${p_disp:-none}" "$want_disp"
+            return 1
+        fi
+    fi
+
+    printf 'ok:%s\n' "$want_wl"
+    return 0
+}
+
+doctor_shell_proc_status() {
+    local pid cmdline count=0 first_pid="" qml_arg="" token prev_p=0 active_gen="" proc_real=""
+    active_gen="$(readlink -f -- "$TARGET_BASE" 2>/dev/null || true)"
+    while IFS= read -r pid; do
+        [[ -n "$pid" && -r "/proc/$pid/cmdline" ]] || continue
+        cmdline="$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null || true)"
+        if [[ "$cmdline" == *"$TARGET_BASE/src/quickshell"* || "$cmdline" == *"$GENERATIONS_BASE/"*"/src/quickshell"* || "$cmdline" == *"/serpantinum"*"/src/quickshell"* ]]; then
+            count=$((count + 1))
+            if [[ -z "$first_pid" ]]; then
+                first_pid="$pid"
+                prev_p=0
+                qml_arg=""
+                while IFS= read -r -d '' token; do
+                    if [[ "$prev_p" -eq 1 ]]; then
+                        qml_arg="$token"
+                        break
+                    fi
+                    [[ "$token" == "-p" || "$token" == "--path" ]] && prev_p=1
+                done < "/proc/$pid/cmdline"
+            fi
+        fi
+    done < <(pgrep -u "$UID" -x quickshell 2>/dev/null || true)
+
+    if [[ "$count" -eq 0 ]]; then
+        printf 'none\n'
+        return 1
+    fi
+    if [[ "$count" -gt 1 ]]; then
+        printf 'duplicate:%s\n' "$count"
+        return 1
+    fi
+    if [[ -n "$active_gen" && -n "$qml_arg" ]]; then
+        proc_real="$(readlink -f -- "$qml_arg" 2>/dev/null || true)"
+        if [[ -n "$proc_real" && "$proc_real" != "$active_gen/"* ]]; then
+            printf 'stale:%s:%s\n' "$first_pid" "${proc_real%/src/quickshell*}"
+            return 1
+        fi
+    fi
+    printf 'ok:%s\n' "$first_pid"
+    return 0
+}
+
+doctor_cli_links_ok() {
+    [[ -d "$TARGET_BASE" ]] || return 0
+    local name src_real dst_real
+    for name in serpantinum serpantinumd; do
+        [[ -f "$TARGET_BASE/bin/$name" ]] || continue
+        [[ -x "$TARGET_BASE/bin/$name" && -x "$BIN_DIR/$name" ]] || return 1
+        src_real="$(readlink -f -- "$TARGET_BASE/bin/$name" 2>/dev/null || true)"
+        dst_real="$(readlink -f -- "$BIN_DIR/$name" 2>/dev/null || true)"
+        [[ -n "$src_real" && "$src_real" == "$dst_real" ]] || return 1
+    done
+    return 0
+}
+
+doctor_settings_json_ok() {
+    [[ -e "$CONFIG_FILE" ]] || return 0
+    [[ -s "$CONFIG_FILE" ]] || return 1
+    if command -v jq >/dev/null 2>&1; then
+        jq empty "$CONFIG_FILE" >/dev/null 2>&1
+        return $?
+    fi
+    return 0
+}
+
+doctor_audio_ok() {
+    pgrep -u "$UID" -x pipewire >/dev/null 2>&1 &&
+    pgrep -u "$UID" -x wireplumber >/dev/null 2>&1
+}
+
 linka_doctor() {
-    local pkg comp version failed=0 installed_flag=0
-    local comps=()
+    local pkg comp version failed=0 fixable=0 installed_flag=0 session_active=0
+    local comps=() portal_st="" shell_st="" comp_pid=""
     if [[ -f "$STATE_FILE" ]]; then
         local saved
         saved="$(state_get SELECTED_COMPOSITORS)"
         read -r -a comps <<< "$saved"
+    fi
+    comp_pid="$(doctor_find_compositor_pid || true)"
+    if [[ -n "$comp_pid" || -n "${WAYLAND_DISPLAY:-}" ]]; then
+        session_active=1
     fi
     printf 'linka %s · диагностика\n' "$LINKA_VERSION"
     printf 'Система: %s\n' "${DISTRO:-не определена}"
@@ -5706,6 +5854,7 @@ linka_doctor() {
     if [[ -f "$STATE_DIR/.linka-journal" ]]; then
         printf 'Восстановление: есть незавершённая операция\n'
         failed=1
+        fixable=1
     fi
     if [[ -f "$STATE_DIR/.linka-rollback" ]]; then
         printf 'Откат: доступен\n'
@@ -5739,6 +5888,20 @@ linka_doctor() {
         fi
     done
     if [[ "$installed_flag" == 1 ]]; then
+        if doctor_cli_links_ok; then
+            printf 'Команды CLI: исправны (%s)\n' "$BIN_DIR"
+        else
+            printf 'Команды CLI: отсутствуют или ведут не на текущее поколение\n'
+            failed=1
+            fixable=1
+        fi
+        if doctor_settings_json_ok; then
+            printf 'Настройки JSON: исправны\n'
+        else
+            printf 'Настройки JSON: повреждён %s\n' "$CONFIG_FILE"
+            failed=1
+            fixable=1
+        fi
         local component_repo="${PROJECT_ROOT:-$CACHE_BASE}"
         [[ ! -f "$TARGET_BASE/.linka-components" ]] || component_repo="$TARGET_BASE"
         if [[ -d "$component_repo" ]]; then
@@ -5749,7 +5912,204 @@ linka_doctor() {
         fi
         printf 'Коммит: %s\n' "$(state_get SHELL_COMMIT)"
     fi
+    if [[ "$session_active" == 1 ]]; then
+        if portal_st="$(doctor_portal_env_status)"; then
+            printf 'Порталы XDG: синхронизированы (%s)\n' "${portal_st#ok:}"
+        else
+            printf 'Порталы XDG: рассинхрон окружения (%s)\n' "$portal_st"
+            failed=1
+            fixable=1
+        fi
+        if doctor_audio_ok; then
+            printf 'Аудио PipeWire: активно\n'
+        else
+            printf 'Аудио PipeWire: pipewire или wireplumber не запущен\n'
+            failed=1
+            fixable=1
+        fi
+        if [[ "$installed_flag" == 1 ]]; then
+            if shell_st="$(doctor_shell_proc_status)"; then
+                printf 'Процесс оболочки: активен (PID %s)\n' "${shell_st#ok:}"
+            else
+                case "$shell_st" in
+                    duplicate:*)
+                        printf 'Процесс оболочки: обнаружено дублирование Quickshell (%s экз.)\n' "${shell_st#duplicate:}"
+                        ;;
+                    stale:*)
+                        printf 'Процесс оболочки: запущено устаревшее поколение (%s)\n' "${shell_st#stale:*:}"
+                        ;;
+                    *)
+                        printf 'Процесс оболочки: не запущен\n'
+                        ;;
+                esac
+                failed=1
+                fixable=1
+            fi
+        fi
+    else
+        printf 'Сессия Wayland: не активна\n'
+    fi
     printf 'Бэкапы: %s\n' "$BACKUP_BASE"
+    if [[ "$fixable" == 1 ]]; then
+        printf 'Автолечение: доступно (запустите linka doctor --fix или linka repair)\n'
+    fi
+    return "$failed"
+}
+
+linka_repair_session() {
+    local fixed=0 failed=0 comp_pid="" shell_st="" v val latest_bak="" cand=""
+    acquire_lock
+    log_info "Запуск автолечения сессии (linka $LINKA_VERSION)..."
+
+    if [[ -f "$STATE_DIR/.linka-journal" ]]; then
+        log_info 'Восстанавливаю незавершённую транзакцию обновления...'
+        if linka_recover_transaction; then
+            fixed=$((fixed + 1))
+        else
+            log_error 'Не удалось автоматически закрыть .linka-journal'
+            failed=1
+        fi
+    fi
+
+    if [[ -d "$TARGET_BASE" ]] && ! doctor_cli_links_ok; then
+        log_info 'Восстанавливаю исполняемые права и симлинки serpantinum/serpantinumd...'
+        mkdir -p "$BIN_DIR"
+        fix_exec_bits || true
+        ln -sfn "$TARGET_BASE/bin/serpantinum" "$BIN_DIR/serpantinum"
+        ln -sfn "$TARGET_BASE/bin/serpantinumd" "$BIN_DIR/serpantinumd"
+        hash -r
+        if doctor_cli_links_ok; then
+            log_ok 'Симлинки CLI восстановлены.'
+            fixed=$((fixed + 1))
+        else
+            log_error 'Не удалось восстановить симлинки CLI.'
+            failed=1
+        fi
+    fi
+
+    if [[ -e "$CONFIG_FILE" ]] && ! doctor_settings_json_ok; then
+        mkdir -p "$BACKUP_BASE" "$CONFIG_DIR"
+        local corrupt_copy="$BACKUP_BASE/settings.corrupt.$(date +%Y%m%d_%H%M%S).json"
+        cp -a -- "$CONFIG_FILE" "$corrupt_copy" 2>/dev/null || true
+        log_warn "Повреждённый settings.json сохранён в $corrupt_copy"
+        while IFS= read -r cand; do
+            [[ -f "$cand" ]] || continue
+            if jq empty "$cand" >/dev/null 2>&1; then
+                latest_bak="$cand"
+                break
+            fi
+        done < <(find "$BACKUP_BASE" -type f -name 'settings.json' -printf '%T@ %p\n' 2>/dev/null | sort -rn | cut -d' ' -f2-)
+        if [[ -n "$latest_bak" ]]; then
+            cp -a -- "$latest_bak" "$CONFIG_FILE"
+            log_ok "Восстановлен валидный settings.json из $latest_bak"
+            fixed=$((fixed + 1))
+        elif [[ -f "$CACHE_BASE/config/serpantinum/settings.json" ]] && jq empty "$CACHE_BASE/config/serpantinum/settings.json" >/dev/null 2>&1; then
+            cp -a -- "$CACHE_BASE/config/serpantinum/settings.json" "$CONFIG_FILE"
+            log_ok 'Восстановлен шаблонный settings.json из локального кэша.'
+            fixed=$((fixed + 1))
+        else
+            printf '{}\n' > "$CONFIG_FILE"
+            log_ok 'Создан чистый settings.json.'
+            fixed=$((fixed + 1))
+        fi
+    fi
+
+    comp_pid="$(doctor_find_compositor_pid || true)"
+    if [[ -n "$comp_pid" ]]; then
+        for v in WAYLAND_DISPLAY DISPLAY XDG_RUNTIME_DIR XDG_CURRENT_DESKTOP XDG_SESSION_TYPE \
+                 DESKTOP_SESSION DBUS_SESSION_BUS_ADDRESS HYPRLAND_INSTANCE_SIGNATURE SWAYSOCK \
+                 NIRI_SOCKET MANGO_INSTANCE_SIGNATURE UMBRIEL_SOCKET; do
+            val="$(doctor_read_proc_var "$comp_pid" "$v" || true)"
+            if [[ -n "$val" ]]; then
+                export "$v=$val"
+            fi
+        done
+    else
+        auto_adopt_session_env || true
+    fi
+
+    if [[ -n "$comp_pid" || -n "${WAYLAND_DISPLAY:-}" ]]; then
+        if ! doctor_portal_env_status >/dev/null 2>&1; then
+            log_info 'Синхронизирую переменные дисплея в D-Bus/systemd и перезапускаю xdg-desktop-portal...'
+            local sync_vars=()
+            for v in WAYLAND_DISPLAY DISPLAY XDG_CURRENT_DESKTOP XDG_SESSION_TYPE \
+                     NIRI_SOCKET HYPRLAND_INSTANCE_SIGNATURE SWAYSOCK MANGO_INSTANCE_SIGNATURE UMBRIEL_SOCKET; do
+                [[ -n "${!v:-}" ]] && sync_vars+=("$v")
+            done
+            if [[ ${#sync_vars[@]} -gt 0 ]]; then
+                if command -v dbus-update-activation-environment >/dev/null 2>&1; then
+                    dbus-update-activation-environment --systemd "${sync_vars[@]}" >/dev/null 2>&1 || true
+                elif command -v systemctl >/dev/null 2>&1; then
+                    systemctl --user import-environment "${sync_vars[@]}" >/dev/null 2>&1 || true
+                fi
+            fi
+            if command -v systemctl >/dev/null 2>&1 && systemctl --user show-environment >/dev/null 2>&1; then
+                systemctl --user restart xdg-desktop-portal-gtk.service >/dev/null 2>&1 || true
+                systemctl --user restart xdg-desktop-portal.service >/dev/null 2>&1 || true
+            fi
+            if doctor_portal_env_status >/dev/null 2>&1; then
+                log_ok 'Окружение xdg-desktop-portal синхронизировано.'
+                fixed=$((fixed + 1))
+            else
+                log_warn 'Не удалось полностью синхронизировать xdg-desktop-portal.'
+                failed=1
+            fi
+        fi
+
+        if ! doctor_audio_ok; then
+            log_info 'Перезапускаю пользовательские службы PipeWire / WirePlumber...'
+            if command -v systemctl >/dev/null 2>&1 && systemctl --user show-environment >/dev/null 2>&1; then
+                systemctl --user start pipewire.socket pipewire-pulse.socket pipewire.service wireplumber.service >/dev/null 2>&1 || true
+                sleep 1
+            fi
+            if doctor_audio_ok; then
+                log_ok 'PipeWire и WirePlumber запущены.'
+                fixed=$((fixed + 1))
+            else
+                log_warn 'PipeWire / WirePlumber всё ещё не активны.'
+                failed=1
+            fi
+        fi
+
+        if [[ -d "$TARGET_BASE" ]]; then
+            if ! shell_st="$(doctor_shell_proc_status)"; then
+                case "$shell_st" in
+                    duplicate:*)
+                        log_info "Устраняю дублирование Quickshell (${shell_st#duplicate:} экз.)..."
+                        stop_shell || kill_serpantinum || true
+                        sleep 1
+                        ;;
+                    stale:*)
+                        log_info 'Перезапускаю оболочку с актуального поколения...'
+                        stop_shell || kill_serpantinum || true
+                        sleep 1
+                        ;;
+                    *)
+                        log_info 'Оболочка не запущена — запускаю serpantinumd...'
+                        ;;
+                esac
+                if start_shell && sleep 2 && doctor_shell_proc_status >/dev/null 2>&1; then
+                    log_ok 'Процесс оболочки Serpantinum восстановлен.'
+                    fixed=$((fixed + 1))
+                else
+                    log_error 'Не удалось запустить оболочку Serpantinum.'
+                    failed=1
+                fi
+            fi
+        fi
+    fi
+
+    if [[ "$fixed" -eq 0 && "$failed" -eq 0 ]]; then
+        log_ok 'Проблем сессии для автолечения не обнаружено.'
+    elif [[ "$failed" -eq 0 ]]; then
+        log_ok "Автолечение завершено (исправлено: $fixed)."
+    else
+        log_warn "Автолечение завершено частично (исправлено: $fixed, остались ошибки)."
+    fi
+
+    end_session
+    printf '\n'
+    linka_doctor || return 1
     return "$failed"
 }
 
@@ -5865,8 +6225,15 @@ main() {
             linka_run_reported rollback linka_rollback
             end_session
             ;;
-        doctor)
-            linka_doctor
+        doctor|--doctor)
+            if [[ "${2:-}" == "--fix" || "${2:-}" == "-f" ]]; then
+                linka_repair_session
+            else
+                linka_doctor
+            fi
+            ;;
+        repair|--repair)
+            linka_repair_session
             ;;
         remove|--remove|uninstall|--uninstall)
             emergency_remove

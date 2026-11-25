@@ -24,7 +24,8 @@ curl -fsSL https://raw.githubusercontent.com/Tkanchik/linka/main/install.sh | ba
 | `linka update` | Обновить Serpantinum до нового коммита. |
 | `linka update --force` | Повторно развернуть файлы текущей версии. |
 | `linka rollback` | Вернуть предыдущее поколение файлов оболочки и настройки. Пакеты ОС не откатываются. |
-| `linka doctor` | Проверить установку, версии и обязательные пакеты без изменений в системе. |
+| `linka doctor` | Проверить установку, версии, живую сессию Wayland, порталы, звук и процесс оболочки без изменений в системе. |
+| `linka doctor --fix` | Автолечение сессии (`linka repair`): восстановить прерванное обновление, симлинки CLI, битый `settings.json`, окружение `xdg-desktop-portal`, PipeWire/WirePlumber и процесс `quickshell` (включая устранение дубликатов и устаревших поколений). |
 | `linka update --dry-run` | Посмотреть порядок действий без установки пакетов и изменения файлов. Работает также с `install`, `reinstall`, `remove` и `rollback`. |
 | `linka kill` | Остановить шелл и его процессы. |
 | `linka remove` | Удалить Serpantinum после сохранения настроек. Сама `linka` остаётся установленной. |
