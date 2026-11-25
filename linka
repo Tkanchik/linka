@@ -7,7 +7,7 @@ readonly REPO_SLUG="ilyamiro/serpantinum"
 readonly WALLPAPER_REPO="https://github.com/ilyamiro/shell-wallpapers.git"
 readonly FONT_URL="https://github.com/ryanoasis/nerd-fonts/releases/latest/download/Iosevka.zip"
 readonly DEFAULT_FALLBACK_VERSION="2.0.0"
-readonly QUICKSHELL_MIN_VERSION="0.2.0"
+readonly QUICKSHELL_MIN_VERSION="0.3.0"
 
 REPO_BRANCH="${SERPANTINUM_BRANCH:-master}"
 ACTIVE_REPO_BRANCH="$REPO_BRANCH"
@@ -218,7 +218,7 @@ flow_install() {
     local comp_arg
     for comp_arg in "$@"; do
         case "${comp_arg,,}" in
-            hyprland|niri|sway|mango)
+            hyprland|niri|sway|mango|umbriel)
                 cli_comps+=("${comp_arg,,}")
                 ;;
         esac
@@ -340,6 +340,10 @@ flow_update() {
         elif matugen_needs_repair "$PROJECT_ROOT"; then
             log_info 'Коммит не изменился, но Matugen повреждён — восстанавливаю файлы.'
             FORCE_UPDATE=1
+        elif sddm_theme_needs_update "$PROJECT_ROOT"; then
+            log_info 'Коммит не изменился, но тема SDDM отличается — обновляю её.'
+            setup_sddm "$PROJECT_ROOT" || true
+            return 0
         else
             log_ok "Уже на $TARGET_VERSION ($TARGET_COMMIT)."
             log_info 'Если цвета обоев пропали, запусти принудительно: linka update --force'
@@ -371,6 +375,9 @@ flow_update() {
     fi
     ensure_mango_compatible || return 1
     transactional_deploy_update "$PROJECT_ROOT" || return 1
+    if sddm_theme_needs_update "$PROJECT_ROOT"; then
+        setup_sddm "$PROJECT_ROOT" || true
+    fi
     if [[ "$AUTO_MODE" != 1 ]]; then
         setup_services || true
     fi
@@ -434,17 +441,17 @@ emergency_remove() {
         run_optional_root rm -f "$SDDM_MANAGED_CONF" || true
     fi
 
-    if [[ -d "$SDDM_THEME_DIR" ]]; then
+    if [[ -d "$SDDM_THEME_DIR" && ! -L "$SDDM_THEME_DIR" ]]; then
         if [[ "$sddm_theme_managed" == true ]]; then
-            run_optional_root rm -rf "$SDDM_THEME_DIR" || true
+            run_optional_root rm -rf -- "$SDDM_THEME_DIR" || true
         else
             log_warn "Каталог темы SDDM $SDDM_THEME_DIR не принадлежит linka — оставляю нетронутым. Для ручного удаления: sudo rm -rf '$SDDM_THEME_DIR'"
         fi
     fi
 
-    if [[ -d "$FONT_SYSTEM_DIR" ]]; then
+    if [[ -d "$FONT_SYSTEM_DIR" && ! -L "$FONT_SYSTEM_DIR" ]]; then
         if [[ "$font_sys_managed" == true ]]; then
-            run_optional_root rm -rf "$FONT_SYSTEM_DIR" || true
+            run_optional_root rm -rf -- "$FONT_SYSTEM_DIR" || true
         else
             log_warn "Каталог системных шрифтов $FONT_SYSTEM_DIR не принадлежит linka — оставляю нетронутым. Для ручного удаления: sudo rm -rf '$FONT_SYSTEM_DIR'"
         fi
@@ -824,25 +831,26 @@ detect_distro_backend() {
 init_package_lists() {
     if [[ "$DISTRO" == 'fedora' ]]; then
         REQUIRED_PKGS=(
-            kitty cava zbar pavucontrol alsa-utils wl-clipboard fd-find ripgrep
+            kitty cava zbar tesseract tesseract-langpack-eng pavucontrol alsa-utils wl-clipboard fd-find ripgrep
             jq socat inotify-tools pamixer brightnessctl ddcutil acpi iw
             bluez libnotify NetworkManager lm_sensors bc pipewire wireplumber
-            pipewire-pulseaudio pipewire-alsa pulseaudio-libs python3 ImageMagick
+            pipewire-pulseaudio pipewire-alsa pipewire-utils pulseaudio-libs python3 ImageMagick
             wget file git psmisc ffmpeg-free fastfetch unzip python3-websockets
             qt6-qtwebsockets qt6-qtmultimedia qt6-qt5compat grim playerctl
-            xdg-desktop-portal-gtk slurp wmctrl easyeffects nautilus qt5-qtwayland
+            xdg-desktop-portal-gtk xdg-user-dirs xwayland-satellite slurp wmctrl easyeffects nautilus qt5-qtwayland
             qt5-qtquickcontrols qt5-qtquickcontrols2 qt6-qtwayland qt5ct qt6ct
-            wf-recorder adw-gtk3-theme
+            adwaita-icon-theme wf-recorder adw-gtk3-theme
+            jetbrains-mono-fonts fontawesome-6-free-fonts
             qt6-qtdeclarative qt6-qtsvg qt6-qtshadertools quickshell
         )
-        SDDM_PKGS=(sddm qt6-qtdeclarative qt6-qtsvg)
+        SDDM_PKGS=(sddm qt6-qtdeclarative qt6-qtsvg sddm-wayland-generic adwaita-cursor-theme)
         OPTIONAL_PKGS=(matugen satty wl-gammarelay-rs cliphist)
         CORE_PKGS=(quickshell qt6-qtdeclarative qt6-qtmultimedia pipewire wireplumber)
         BOOTSTRAP_TOOLS=(jq curl git unzip fc-list)
         BOOTSTRAP_PKGS=(jq curl git unzip fontconfig)
     else
         REQUIRED_PKGS=(
-            dev-vcs/git media-gfx/zbar media-sound/pavucontrol media-sound/alsa-utils
+            dev-vcs/git media-gfx/zbar app-text/tesseract app-text/tessdata_fast media-sound/pavucontrol media-sound/alsa-utils
             gui-apps/wl-clipboard sys-apps/fd sys-apps/ripgrep
             app-misc/cliphist
             app-misc/jq net-misc/socat sys-fs/inotify-tools media-sound/pamixer
@@ -853,18 +861,19 @@ init_package_lists() {
             sys-apps/file sys-process/psmisc media-video/ffmpeg app-misc/fastfetch
             app-arch/unzip dev-python/websockets dev-qt/qtwebsockets dev-qt/qtmultimedia
             dev-qt/qt5compat gui-apps/grim media-sound/playerctl
-            sys-apps/xdg-desktop-portal-gtk
+            sys-apps/xdg-desktop-portal-gtk x11-misc/xdg-user-dirs x11-misc/xdg-utils gui-apps/xwayland-satellite
             gui-apps/slurp x11-misc/wmctrl
             media-sound/easyeffects gnome-base/nautilus dev-qt/qtwayland
-            gui-apps/qt6ct
+            gui-apps/qt6ct x11-themes/adwaita-icon-theme
             dev-qt/qtdeclarative dev-qt/qtsvg dev-qt/qtshadertools
             gui-apps/wf-recorder x11-themes/adw-gtk3 media-video/gpu-screen-recorder
             x11-terms/kitty media-sound/cava gui-apps/quickshell
+            media-fonts/jetbrains-mono media-fonts/fontawesome
             x11-misc/matugen
             gui-apps/satty
             sys-power/power-profiles-daemon
         )
-        SDDM_PKGS=(x11-misc/sddm dev-qt/qtdeclarative dev-qt/qtsvg)
+        SDDM_PKGS=(gui-apps/sddm gui-apps/sddm-gentoo-config dev-qt/qtdeclarative dev-qt/qtsvg)
         OPTIONAL_PKGS=(gui-apps/wl-gammarelay-rs)
         CORE_PKGS=(gui-apps/quickshell dev-qt/qtdeclarative dev-qt/qtmultimedia media-video/pipewire media-video/wireplumber)
         BOOTSTRAP_TOOLS=(jq curl git unzip fc-list)
@@ -936,6 +945,7 @@ comp_atom() {
             niri)     printf 'niri\n' ;;
             sway)     printf 'sway\n' ;;
             mango)    printf 'mangowm\n' ;;
+            umbriel)  printf 'umbriel-nightly\n' ;;
             *)        printf '%s\n' "$1" ;;
         esac
         return 0
@@ -946,6 +956,7 @@ comp_atom() {
         niri)     printf 'gui-wm/niri\n' ;;
         sway)     printf 'gui-wm/sway\n' ;;
         mango)    printf 'gui-wm/mangowm\n' ;;
+        umbriel)  printf 'gui-wm/umbriel\n' ;;
         *)        printf '%s\n' "$1" ;;
     esac
 }
@@ -969,6 +980,10 @@ is_compositor_installed() {
         mango)
             command -v mango >/dev/null 2>&1 ||
             pkg_installed "$(comp_atom mango)" 2>/dev/null
+            ;;
+        umbriel)
+            command -v umbriel >/dev/null 2>&1 ||
+            pkg_installed "$(comp_atom umbriel)" 2>/dev/null
             ;;
         *)
             command -v "$comp" >/dev/null 2>&1 ||
@@ -1281,9 +1296,9 @@ install_dependencies() {
                                 log_warn 'Плагин dnf copr недоступен — yalter/niri не подключен'
                             fi
                         fi
-                    elif [[ "$c" == mango ]]; then
+                    elif [[ "$c" == mango || "$c" == umbriel ]]; then
                         if ! fedora_enable_terra; then
-                            log_warn 'Fedora: не удалось подключить Terra — MangoWM не установлен.'
+                            log_warn "Fedora: не удалось подключить Terra — $pkg не установлен."
                             FAILED_PKGS+=("$pkg")
                             continue
                         fi
@@ -1310,17 +1325,29 @@ install_dependencies() {
         target_list=("${REQUIRED_PKGS[@]}")
 
         local serp_use=(
-            "media-video/pipewire dbus extra sound-server"
-            "dev-qt/qtmultimedia qml ffmpeg"
+            "media-video/pipewire dbus extra sound-server pipewire-alsa bluetooth echo-cancel"
+            "media-video/ffmpeg vulkan"
+            "dev-qt/qtmultimedia qml pipewire wayland ffmpeg"
+            "dev-qt/qtwayland qml"
+            "dev-qt/qtdeclarative svg wayland"
+            "dev-qt/qtbase dbus gui network opengl vulkan wayland"
+            "app-text/tesseract png"
+            "gui-apps/wf-recorder pipewire"
+            "x11-terms/kitty wayland"
+            "sys-apps/xdg-desktop-portal-gtk wayland"
             "gui-apps/quickshell layer-shell pipewire screencopy"
         )
+        for comp in "${compositors[@]}"; do
+            c="${comp,,}"
+            if [[ "$c" == mango ]]; then
+                serp_use+=("gui-libs/wlroots X" "gui-wm/mangowm X")
+            elif [[ "$c" == umbriel ]]; then
+                serp_use+=("gui-libs/wlroots X")
+            fi
+        done
 
         if [[ -d /etc/portage/package.use ]]; then
-            run_root tee /etc/portage/package.use/serpantinum >/dev/null <<'EOF_USE' || log_warn 'Gentoo: не удалось записать package.use/serpantinum'
-media-video/pipewire dbus extra sound-server
-dev-qt/qtmultimedia qml ffmpeg
-gui-apps/quickshell layer-shell pipewire screencopy
-EOF_USE
+            printf '%s\n' "${serp_use[@]}" | run_root tee /etc/portage/package.use/serpantinum >/dev/null || log_warn 'Gentoo: не удалось записать package.use/serpantinum'
         elif [[ -f /etc/portage/package.use ]]; then
             local uflag
             for uflag in "${serp_use[@]}"; do
@@ -1330,11 +1357,7 @@ EOF_USE
             done
         else
             run_root mkdir -p /etc/portage/package.use || log_warn 'Gentoo: не удалось создать /etc/portage/package.use'
-            run_root tee /etc/portage/package.use/serpantinum >/dev/null <<'EOF_USE' || log_warn 'Gentoo: не удалось записать package.use/serpantinum'
-media-video/pipewire dbus extra sound-server
-dev-qt/qtmultimedia qml ffmpeg
-gui-apps/quickshell layer-shell pipewire screencopy
-EOF_USE
+            printf '%s\n' "${serp_use[@]}" | run_root tee /etc/portage/package.use/serpantinum >/dev/null || log_warn 'Gentoo: не удалось записать package.use/serpantinum'
         fi
 
         gentoo_ensure_guru
@@ -1802,9 +1825,12 @@ fedora_enable_terra() {
         return 0
     fi
 
-    log_info 'Fedora: подключаю репозиторий Terra для MangoWM...'
-    run_root dnf install -y --nogpgcheck --repofrompath \
-        'terra,https://repos.fyralabs.com/terra$releasever' terra-release
+    log_info 'Fedora: подключаю репозиторий Terra...'
+    run_root dnf install -y \
+        --repofrompath 'terra,https://repos.fyralabs.com/terra$releasever' \
+        --setopt=terra.gpgcheck=1 \
+        --setopt='terra.gpgkey=https://repos.fyralabs.com/terra$releasever/key.asc' \
+        terra-release
 }
 
 find_serpantinumd() {
@@ -1996,74 +2022,91 @@ kill_serpantinum() {
 }
 
 is_sddm_theme_managed() {
+    [[ -L "$SDDM_THEME_DIR" ]] && return 1
     [[ ! -e "$SDDM_THEME_DIR" ]] && return 0
-    [[ -f "$SDDM_THEME_DIR/.linka-managed" ]] && return 0
-    [[ -f "$SDDM_MANAGED_CONF" ]] && return 0
-    return 1
+    [[ -d "$SDDM_THEME_DIR" && -f "$SDDM_THEME_DIR/.linka-managed" && ! -L "$SDDM_THEME_DIR/.linka-managed" ]]
+}
+
+sddm_theme_needs_update() {
+    local src="$1/config/sddm/themes/material-you"
+    [[ "$OPT_SDDM" == true && -d "$src" ]] || return 1
+    [[ -L "$SDDM_THEME_DIR" ]] && return 1
+    [[ -d "$SDDM_THEME_DIR" ]] || return 0
+    is_sddm_theme_managed || return 1
+    ! diff -qr --exclude=.linka-managed "$src" "$SDDM_THEME_DIR" >/dev/null 2>&1
 }
 
 is_font_system_managed() {
     [[ -L "$FONT_SYSTEM_DIR" ]] && return 1
     [[ ! -e "$FONT_SYSTEM_DIR" ]] && return 0
-    [[ -f "$FONT_SYSTEM_DIR/.linka-managed" ]]
+    [[ -d "$FONT_SYSTEM_DIR" && -f "$FONT_SYSTEM_DIR/.linka-managed" && ! -L "$FONT_SYSTEM_DIR/.linka-managed" ]]
 }
 
 install_fonts() {
     local target="$USER_FONT_DIR"
-    local cache zip
-    cache="${XDG_CACHE_HOME:-$HOME/.cache}/serpantinum-fonts"
-    zip="$cache/Iosevka.zip"
+    local cache='' zip sha_file expected_sha actual_sha
+    local sys_ttfs=() f
 
+    [[ ! -L "$target" ]] || {
+        log_warn "Пользовательский каталог шрифтов $target является симлинком — пропускаю установку."
+        return 1
+    }
     mkdir -p "$target"
 
     if ! compgen -G "$target/*.ttf" >/dev/null 2>&1; then
-        if command -v curl >/dev/null 2>&1 && command -v unzip >/dev/null 2>&1; then
+        if command -v curl >/dev/null 2>&1 && command -v unzip >/dev/null 2>&1 && command -v sha256sum >/dev/null 2>&1; then
             log_info 'Шрифты Iosevka (может занять минуту на слабом канале)...'
-            mkdir -p "$cache"
+            cache="$(mktemp -d "${TMPDIR:-/tmp}/linka-fonts.XXXXXXXX")" || return 1
+            zip="$cache/Iosevka.zip"
+            sha_file="$cache/SHA-256.txt"
 
-            if curl -fL --connect-timeout 15 --retry 3 "$FONT_URL" -o "$zip"; then
-                local sha_file="$cache/SHA-256.txt"
-                local expected_sha actual_sha
-                if curl -fsSL --connect-timeout 10 "https://github.com/ryanoasis/nerd-fonts/releases/latest/download/SHA-256.txt" -o "$sha_file" 2>/dev/null; then
-                    expected_sha="$(grep -i 'Iosevka.zip$' "$sha_file" 2>/dev/null | awk '{print $1}' | head -n1)"
-                    if [[ -n "$expected_sha" ]] && command -v sha256sum >/dev/null 2>&1; then
-                        actual_sha="$(sha256sum "$zip" | awk '{print $1}')"
-                        if [[ "$expected_sha" != "$actual_sha" ]]; then
-                            log_error "Контрольная сумма шрифтов не совпадает (ожидалась: $expected_sha, получена: $actual_sha). Загрузка отменена."
-                            rm -rf "$cache"
-                            return 1
-                        fi
-                        log_info "Контрольная сумма Iosevka.zip проверена ($expected_sha)."
-                    fi
-                else
-                    log_warn 'Не удалось скачать контрольные суммы SHA-256.txt, продолжаю без сверки хеша.'
-                fi
-
-                if unzip -qo "$zip" -d "$cache/x"; then
-                    find "$cache/x" -type f -iname '*.ttf' ! -iname '*Mono*.ttf' -exec cp -f {} "$target/" \;
-                    touch "$target/.linka-managed" 2>/dev/null || true
-                else
-                    log_warn 'Шрифты: не удалось распаковать'
-                fi
-            else
+            if ! curl --proto '=https' --proto-redir '=https' -fLsS --connect-timeout 15 --max-time 300 --retry 3 "$FONT_URL" -o "$zip"; then
                 log_warn 'Шрифты: не удалось скачать'
+                rm -rf -- "$cache"
+                return 1
             fi
-        else
-            log_warn 'Шрифты: нет curl/unzip, пропускаю загрузку'
-        fi
 
-        rm -rf "$cache"
+            if ! curl --proto '=https' --proto-redir '=https' -fLsS --connect-timeout 10 --max-time 60 --retry 2 "https://github.com/ryanoasis/nerd-fonts/releases/latest/download/SHA-256.txt" -o "$sha_file"; then
+                log_error 'Не удалось скачать контрольные суммы SHA-256.txt. Установка шрифтов отменена.'
+                rm -rf -- "$cache"
+                return 1
+            fi
+
+            expected_sha="$(awk 'tolower($2) ~ /(^|\/|\*)iosevka\.zip$/ {print $1; exit}' "$sha_file" | tr -d '\r')"
+            actual_sha="$(sha256sum "$zip" | awk '{print $1}')"
+            if [[ ! "$expected_sha" =~ ^[a-fA-F0-9]{64}$ || "${expected_sha,,}" != "$actual_sha" ]]; then
+                log_error "Контрольная сумма шрифтов не совпадает или отсутствует (ожидалась: ${expected_sha:-none}, получена: $actual_sha). Загрузка отменена."
+                rm -rf -- "$cache"
+                return 1
+            fi
+            log_info "Контрольная сумма Iosevka.zip проверена ($actual_sha)."
+
+            if mkdir -p "$cache/x" && unzip -qo "$zip" -d "$cache/x"; then
+                find "$cache/x" -type f -iname '*.ttf' ! -iname '*Mono*.ttf' -exec install -m 0644 -t "$target" -- {} +
+                touch "$target/.linka-managed" 2>/dev/null || true
+            else
+                log_warn 'Шрифты: не удалось распаковать'
+            fi
+
+            rm -rf -- "$cache"
+        else
+            log_warn 'Шрифты: нет curl/unzip/sha256sum, пропускаю загрузку'
+        fi
     fi
 
     fc-cache -f "$HOME/.local/share/fonts" >/dev/null 2>&1 || true
 
-    if compgen -G "$target/*.ttf" >/dev/null 2>&1; then
-        if [[ -d "$FONT_SYSTEM_DIR" ]] && ! is_font_system_managed; then
+    while IFS= read -r -d '' f; do
+        [[ ! -L "$f" && -f "$f" ]] && sys_ttfs+=("$f")
+    done < <(find "$target" -maxdepth 1 -type f -iname '*.ttf' -print0 2>/dev/null)
+
+    if [[ ${#sys_ttfs[@]} -gt 0 ]]; then
+        if [[ -e "$FONT_SYSTEM_DIR" || -L "$FONT_SYSTEM_DIR" ]] && ! is_font_system_managed; then
             log_warn "Каталог системных шрифтов $FONT_SYSTEM_DIR не управляется linka. Пропускаю установку системных шрифтов."
         else
-            run_optional_root mkdir -p "$FONT_SYSTEM_DIR" || true
-            run_optional_root cp -f "$target"/*.ttf "$FONT_SYSTEM_DIR/" || true
-            run_optional_root touch "$FONT_SYSTEM_DIR/.linka-managed" 2>/dev/null || true
+            run_optional_root install -d -m 0755 -o root -g root -- "$FONT_SYSTEM_DIR" || true
+            run_optional_root install -m 0644 -o root -g root -t "$FONT_SYSTEM_DIR" -- "${sys_ttfs[@]}" || true
+            run_optional_root install -m 0644 -o root -g root /dev/null "$FONT_SYSTEM_DIR/.linka-managed" 2>/dev/null || true
             run_optional_root fc-cache -f /usr/share/fonts >/dev/null 2>&1 || true
         fi
     fi
@@ -2211,6 +2254,7 @@ ensure_sddm_package() {
         if [[ ${#pkgs[@]} -eq 0 ]]; then
             pkgs=(sddm qt6-qtdeclarative qt6-qtsvg)
         fi
+        pkgs+=(rsync)
         local missing=()
         local pkg
         for pkg in "${pkgs[@]}"; do
@@ -2225,7 +2269,7 @@ ensure_sddm_package() {
 
         run_root dnf install -y "${missing[@]}" || return 1
     else
-        local sddm_atoms=(x11-misc/sddm dev-qt/qtdeclarative dev-qt/qtsvg)
+        local sddm_atoms=(gui-apps/sddm gui-apps/sddm-gentoo-config dev-qt/qtdeclarative dev-qt/qtsvg net-misc/rsync)
         if [[ "$(detect_init_system)" == openrc ]]; then
             sddm_atoms+=(gui-libs/display-manager-init)
         fi
@@ -2265,21 +2309,22 @@ setup_sddm() {
         return 0
     fi
 
-    if [[ -d "$SDDM_THEME_DIR" ]] && ! is_sddm_theme_managed; then
+    if [[ -e "$SDDM_THEME_DIR" || -L "$SDDM_THEME_DIR" ]] && ! is_sddm_theme_managed; then
         log_warn "Каталог темы SDDM $SDDM_THEME_DIR уже существует и не управляется linka (нет метки .linka-managed). Пропускаю установку темы SDDM."
     else
-        if ! run_root mkdir -p /etc/sddm.conf.d "$SDDM_THEME_DIR"; then
+        if ! run_root install -d -m 0755 -o root -g root -- /etc/sddm.conf.d "$SDDM_THEME_DIR"; then
             log_warn 'SDDM: не удалось создать каталоги'
             return 0
         fi
 
-        if ! run_root cp -a "$src/." "$SDDM_THEME_DIR/"; then
+        if ! run_root rsync -rt --chown=root:root --safe-links --delete --exclude='/.linka-managed' "$src/" "$SDDM_THEME_DIR/"; then
             log_warn 'SDDM: не удалось скопировать тему'
             return 0
         fi
 
-        run_root touch "$SDDM_THEME_DIR/.linka-managed" 2>/dev/null || true
-        run_root chmod -R a+rX "$SDDM_THEME_DIR" || true
+        run_root chown -R root:root "$SDDM_THEME_DIR" 2>/dev/null || true
+        run_root install -m 0644 -o root -g root /dev/null "$SDDM_THEME_DIR/.linka-managed" 2>/dev/null || true
+        run_root chmod -R a+rX,go-w,a-s "$SDDM_THEME_DIR" || true
 
         if ! run_root tee "$SDDM_MANAGED_CONF" >/dev/null <<'EOF_SDDM'
 [Theme]
@@ -2374,6 +2419,7 @@ get_compositor_config_dir_name() {
         niri)     printf 'niri\n' ;;
         sway)     printf 'sway\n' ;;
         mango)    printf 'mango\n' ;;
+        umbriel)  printf 'umbriel\n' ;;
         *)        printf '%s\n' "$1" ;;
     esac
 }
@@ -3121,7 +3167,7 @@ init_compositor_detection() {
     local c
     local running=''
 
-    for c in hyprland niri sway mango; do
+    for c in hyprland niri sway mango umbriel; do
         if is_compositor_installed "$c"; then
             installed+=("$c")
         fi
@@ -3146,6 +3192,10 @@ init_compositor_detection() {
     elif pgrep -x niri >/dev/null 2>&1 ||
          [[ "$de" == *niri* || "$se" == *niri* ]]; then
         running=niri
+    elif [[ -n "${UMBRIEL_SOCKET:-}" ]] ||
+         pgrep -x umbriel >/dev/null 2>&1 ||
+         [[ "$de" == *umbriel* || "$se" == *umbriel* ]]; then
+        running=umbriel
     fi
 
     SELECTED_COMPOSITORS=()
@@ -3377,9 +3427,9 @@ manage_compositors_menu() {
 
     local cursor=0
     local k
-    local m_hypr m_niri m_sway m_mango
+    local m_hypr m_niri m_sway m_mango m_umbriel
     local sel
-    local st_hypr="не установлен" st_niri="не установлен" st_sway="не установлен" st_mango="не установлен"
+    local st_hypr="не установлен" st_niri="не установлен" st_sway="не установлен" st_mango="не установлен" st_umbriel="не установлен"
 
     if is_compositor_installed hyprland; then
         st_hypr="установлен"
@@ -3393,12 +3443,15 @@ manage_compositors_menu() {
     if is_compositor_installed mango; then
         st_mango="установлен"
     fi
+    if is_compositor_installed umbriel; then
+        st_umbriel="установлен"
+    fi
 
     local rendered_lines=0
 
     while true; do
         draw_banner
-        printf "%s%sЦелевой композитор (niri, hyprland, sway, mango):%s\n\n" "$BOLD" "$C_CYAN" "$RESET"
+        printf "%s%sЦелевой композитор (niri, hyprland, sway, mango, umbriel):%s\n\n" "$BOLD" "$C_CYAN" "$RESET"
         rendered_lines=0
 
         while true; do
@@ -3406,6 +3459,7 @@ manage_compositors_menu() {
             m_niri="[ ]"
             m_sway="[ ]"
             m_mango="[ ]"
+            m_umbriel="[ ]"
 
             sel="$(selected_compositors_string)"
 
@@ -3413,13 +3467,15 @@ manage_compositors_menu() {
             if [[ " ${sel:-} " == *" niri "* ]]; then m_niri="${C_GREEN}[✓]${RESET}"; fi
             if [[ " ${sel:-} " == *" sway "* ]]; then m_sway="${C_GREEN}[✓]${RESET}"; fi
             if [[ " ${sel:-} " == *" mango "* ]]; then m_mango="${C_GREEN}[✓]${RESET}"; fi
+            if [[ " ${sel:-} " == *" umbriel "* ]]; then m_umbriel="${C_GREEN}[✓]${RESET}"; fi
 
             local items=(
                 "1. $m_niri Niri (${st_niri})"
                 "2. $m_hypr Hyprland (${st_hypr})"
                 "3. $m_sway Sway (${st_sway})"
                 "4. $m_mango Mango (${st_mango})"
-                "5. ${BOLD}Готово (назад)${RESET}"
+                "5. $m_umbriel Umbriel (${st_umbriel})"
+                "6. ${BOLD}Готово (назад)${RESET}"
             )
 
             if [[ "$rendered_lines" -gt 0 ]]; then
@@ -3439,21 +3495,23 @@ manage_compositors_menu() {
 
             case "$k" in
                 UP|[kK])
-                    if [[ "$cursor" -gt 0 ]]; then cursor=$((cursor-1)); else cursor=4; fi ;;
+                    if [[ "$cursor" -gt 0 ]]; then cursor=$((cursor-1)); else cursor=5; fi ;;
                 DOWN|[jJ])
-                    if [[ "$cursor" -lt 4 ]]; then cursor=$((cursor+1)); else cursor=0; fi ;;
+                    if [[ "$cursor" -lt 5 ]]; then cursor=$((cursor+1)); else cursor=0; fi ;;
                 "1") toggle_compositor niri ;;
                 "2") toggle_compositor hyprland ;;
                 "3") toggle_compositor sway ;;
                 "4") toggle_compositor mango ;;
-                "5"|ESC|[qQ]) return 0 ;;
+                "5") toggle_compositor umbriel ;;
+                "6"|ESC|[qQ]) return 0 ;;
                 ENTER|SPACE)
                     case "$cursor" in
                         0) toggle_compositor niri ;;
                         1) toggle_compositor hyprland ;;
                         2) toggle_compositor sway ;;
                         3) toggle_compositor mango ;;
-                        4) return 0 ;;
+                        4) toggle_compositor umbriel ;;
+                        5) return 0 ;;
                     esac
                     ;;
             esac
@@ -3963,7 +4021,7 @@ auto_adopt_session_env() {
         pid="$({ pgrep -f "$TARGET_BASE/bin/serpantinumd" || pgrep -f "$BIN_DIR/serpantinumd"; } 2>/dev/null | head -n1 || true)"
     fi
     if [[ -z "$pid" ]]; then
-        pid="$({ pgrep -x niri || pgrep -x Hyprland || pgrep -x sway || pgrep -x mango; } 2>/dev/null | head -n1 || true)"
+        pid="$({ pgrep -x niri || pgrep -x Hyprland || pgrep -x sway || pgrep -x mango || pgrep -x umbriel; } 2>/dev/null | head -n1 || true)"
     fi
 
     if [[ -z "$pid" || ! -r "/proc/$pid/environ" ]]; then
@@ -3974,7 +4032,7 @@ auto_adopt_session_env() {
         case "$line" in
             WAYLAND_DISPLAY=*|DISPLAY=*|XDG_RUNTIME_DIR=*|XDG_CURRENT_DESKTOP=*|\
             XDG_SESSION_TYPE=*|DESKTOP_SESSION=*|DBUS_SESSION_BUS_ADDRESS=*|\
-            HYPRLAND_INSTANCE_SIGNATURE=*|SWAYSOCK=*|NIRI_SOCKET=*|MANGO_INSTANCE_SIGNATURE=*|QT_QPA_PLATFORM=*)
+            HYPRLAND_INSTANCE_SIGNATURE=*|SWAYSOCK=*|NIRI_SOCKET=*|MANGO_INSTANCE_SIGNATURE=*|UMBRIEL_SOCKET=*|QT_QPA_PLATFORM=*)
                 export "${line?}"
                 ;;
         esac
