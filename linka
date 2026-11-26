@@ -2,7 +2,7 @@
 
 set -Eeuo pipefail
 
-readonly LINKA_VERSION="4.13.0"
+readonly LINKA_VERSION="4.13.1"
 readonly REPO_SLUG="ilyamiro/serpantinum"
 readonly WALLPAPER_REPO="https://github.com/ilyamiro/shell-wallpapers.git"
 readonly FONT_URL="https://github.com/ryanoasis/nerd-fonts/releases/latest/download/Iosevka.zip"
@@ -194,6 +194,7 @@ init_optional_env() {
     : "${DESKTOP_SESSION:=}"
     : "${HYPRLAND_INSTANCE_SIGNATURE:=}"
     : "${SWAYSOCK:=}"
+    [[ ":$PATH:" == *":$BIN_DIR:"* ]] || export PATH="$BIN_DIR:$PATH"
     return 0
 }
 init_optional_env
@@ -430,8 +431,10 @@ emergency_remove() {
 
     auto_disable --quiet || true
 
-    if [[ -d "$TARGET_BASE" ]]; then
-        rm -rf "$TARGET_BASE"
+    if [[ -L "$TARGET_BASE" ]]; then
+        rm -f -- "$TARGET_BASE"
+    elif [[ -d "$TARGET_BASE" ]]; then
+        rm -rf -- "$TARGET_BASE"
     fi
     if [[ -d "$GENERATIONS_BASE" && ! -L "$GENERATIONS_BASE" ]]; then
         rm -rf -- "$GENERATIONS_BASE"
@@ -475,7 +478,7 @@ emergency_remove() {
         fi
     fi
 
-    rm -f "$STATE_FILE" "$STATE_DIR/version" "$STATE_DIR/.last-update-backup" 2>/dev/null || true
+    rm -f "$STATE_FILE" "$STATE_DIR/version" "$STATE_DIR/.last-update-backup" "$STATE_DIR/.linka-rollback" "$STATE_DIR/.linka-journal" 2>/dev/null || true
     rm -rf "$STATE_DIR/sounds" 2>/dev/null || true
 
     end_session
@@ -870,7 +873,7 @@ init_package_lists() {
         BOOTSTRAP_PKGS=(jq curl git unzip fontconfig)
     elif [[ "$DISTRO" == 'opensuse' ]]; then
         REQUIRED_PKGS=(
-            kitty cava zbar tesseract-ocr tesseract-ocr-traineddata-english pavucontrol alsa-utils
+            kitty cava zbar tesseract-ocr tesseract-ocr-traineddata-eng pavucontrol alsa-utils
             wl-clipboard fd ripgrep cliphist jq socat inotify-tools brightnessctl
             ddcutil acpi iw bluez libnotify-tools NetworkManager sensors bc
             pipewire wireplumber pipewire-pulseaudio pipewire-alsa pipewire-tools libpulse0 python3
@@ -941,6 +944,7 @@ init_package_lists() {
 }
 
 preflight() {
+    [[ ":$PATH:" == *":$BIN_DIR:"* ]] || export PATH="$BIN_DIR:$PATH"
     DISTRO="$(detect_distro_backend)"
     if [[ -z "$DISTRO" ]]; then
         log_error 'Поддерживаются только Gentoo, Fedora, openSUSE и Debian/Ubuntu.'
@@ -978,12 +982,29 @@ pkg_installed() {
         return 1
     fi
 
+    if [[ "$pkg" == [\>\<=\~]* ]]; then
+        if command -v portageq >/dev/null 2>&1; then
+            portageq has_version / "$pkg" >/dev/null 2>&1
+            return $?
+        fi
+    fi
+
     if [[ -d /var/db/pkg ]]; then
-        local clean="${pkg#[><=~]}"
+        local clean="$pkg" entry name ver pn
+        while [[ "$clean" == [\>\<=\~]* ]]; do
+            clean="${clean#?}"
+        done
         clean="${clean%%:*}"
-        clean="${clean%%-[0-9]*}"
-        if compgen -G "/var/db/pkg/${clean}-[0-9]*" >/dev/null 2>&1; then
-            return 0
+        if [[ "$clean" == */* ]]; then
+            pn="${clean#*/}"
+            for entry in "/var/db/pkg/${clean}-"[0-9]*; do
+                [[ -d "$entry" ]] || continue
+                name="${entry##*/}"
+                ver="${name#"${pn}-"}"
+                if [[ "$ver" =~ ^[0-9]+(\.[0-9]+)*[a-z]?((_alpha|_beta|_pre|_rc|_p)[0-9]*)*(-r[0-9]+)?$ ]]; then
+                    return 0
+                fi
+            done
         fi
     fi
 
@@ -1356,10 +1377,16 @@ install_dependencies() {
         if [[ ${#OPTIONAL_PKGS[@]} -gt 0 ]]; then
             for pkg in "${OPTIONAL_PKGS[@]}"; do
                 if ! pkg_installed "$pkg"; then
-                    run_root dnf install -y --skip-unavailable "$pkg" || log_warn "optional: $pkg недоступен"
+                    if [[ "$pkg" == cliphist ]] && ! dnf repoquery --available --quiet cliphist 2>/dev/null | grep -q . && fedora_ensure_copr_plugin; then
+                        fedora_enable_copr mecattaf/duoRPM || true
+                    fi
+                    run_root dnf install -y --skip-unavailable "$pkg" || log_warn "optional: $pkg недоступен в dnf"
                 fi
             done
         fi
+
+        debian_ensure_matugen || log_warn 'Fedora: matugen 4+ не установлен'
+        debian_ensure_satty || log_warn 'Fedora: satty не установлен'
 
         if [[ ${#compositors[@]} -gt 0 ]]; then
             for comp in "${compositors[@]}"; do
@@ -1367,12 +1394,14 @@ install_dependencies() {
                 pkg="$(comp_atom "$c")"
                 if ! is_compositor_installed "$c" || { [[ "$c" == mango ]] && ! mango_version_ok; }; then
                     if [[ "$c" == hyprland ]]; then
-                        if fedora_ensure_copr_plugin; then
-                            log_info 'Fedora: подключаю COPR solopasha/hyprland...'
-                            fedora_enable_copr solopasha/hyprland ||
-                                log_warn 'COPR solopasha/hyprland не включился — hyprland может не установиться'
-                        else
-                            log_warn 'Плагин dnf copr недоступен — solopasha/hyprland не подключен'
+                        if ! dnf repoquery --available --quiet hyprland 2>/dev/null | grep -q .; then
+                            if fedora_ensure_copr_plugin; then
+                                log_info 'Fedora: подключаю COPR mineiro/hyprland (fallback solopasha/hyprland)...'
+                                fedora_enable_copr mineiro/hyprland || fedora_enable_copr solopasha/hyprland ||
+                                    log_warn 'COPR для hyprland не включился — hyprland может не установиться'
+                            else
+                                log_warn 'Плагин dnf copr недоступен — COPR hyprland не подключен'
+                            fi
                         fi
                     elif [[ "$c" == niri ]]; then
                         if ! dnf info niri >/dev/null 2>&1; then
@@ -1439,6 +1468,7 @@ install_dependencies() {
 
         debian_ensure_matugen || log_warn 'openSUSE: matugen не установлен'
         debian_ensure_satty || log_warn 'openSUSE: satty не установлен'
+        ensure_adw_gtk3_theme || true
         opensuse_ensure_quickshell || log_warn 'openSUSE: quickshell не удалось установить или собрать'
 
         if [[ ${#compositors[@]} -gt 0 ]]; then
@@ -1489,6 +1519,7 @@ install_dependencies() {
 
         debian_ensure_matugen || log_warn 'Debian/Ubuntu: matugen не установлен'
         debian_ensure_satty || log_warn 'Debian/Ubuntu: satty не установлен'
+        ensure_adw_gtk3_theme || true
         debian_ensure_quickshell || log_warn 'Debian/Ubuntu: quickshell не удалось установить или собрать'
 
         if [[ ${#compositors[@]} -gt 0 ]]; then
@@ -1601,7 +1632,7 @@ install_dependencies() {
             log_warn 'Gentoo: autounmask не завершился чисто'
         fi
 
-        run_root emerge --ask=n --newuse --autounmask-continue "${target_list[@]}" || log_warn 'Gentoo: emerge не полный'
+        run_root emerge --ask=n --update --newuse --noreplace --autounmask-continue "${target_list[@]}" || log_warn 'Gentoo: emerge не полный'
     fi
 
     for pkg in "${target_list[@]}"; do
@@ -2106,9 +2137,28 @@ debian_ensure_satty() {
     debian_install_release_tarball "$url" satty
 }
 
+ensure_adw_gtk3_theme() {
+    if [[ -d /usr/share/themes/adw-gtk3 || -d "$HOME/.local/share/themes/adw-gtk3" ]]; then
+        return 0
+    fi
+    local url="" tmp=""
+    url="$(curl --proto '=https' --proto-redir '=https' -fsSL --connect-timeout 15 --retry 2 'https://api.github.com/repos/lassekongo83/adw-gtk3/releases/latest' 2>/dev/null | jq -r '[.assets[] | select(.name | test("\\.tar\\.xz$"))][0].browser_download_url // empty' 2>/dev/null || true)"
+    [[ -n "$url" ]] || return 1
+    tmp="$(mktemp -d "${TMPDIR:-/tmp}/linka-adw.XXXXXXXX")" || return 1
+    mkdir -p "$HOME/.local/share/themes"
+    if curl --proto '=https' --proto-redir '=https' -fLsS --connect-timeout 15 --max-time 120 --retry 2 "$url" -o "$tmp/adw.tar.xz" &&
+       tar -xJf "$tmp/adw.tar.xz" -C "$HOME/.local/share/themes"; then
+        rm -rf -- "$tmp"
+        log_ok 'Тема adw-gtk3 установлена в ~/.local/share/themes'
+        return 0
+    fi
+    rm -rf -- "$tmp"
+    return 1
+}
+
 opensuse_pkg_available() {
     local pkg="$1"
-    zypper --non-interactive --quiet se -x "$pkg" >/dev/null 2>&1
+    zypper --non-interactive --quiet se --provides --match-exact "$pkg" >/dev/null 2>&1
 }
 
 opensuse_filter_pkgs() {
@@ -2129,7 +2179,7 @@ opensuse_filter_pkgs() {
         done < <(awk -F'|' 'NF>=2 {gsub(/^[[:space:]]+|[[:space:]]+$/, "", $2); if ($2 != "" && $2 != "Name") print $2}' <<< "$zout")
     fi
     for pkg in "$@"; do
-        if [[ "$found_names" == *" $pkg "* ]] || pkg_installed "$pkg"; then
+        if [[ "$found_names" == *" $pkg "* ]] || pkg_installed "$pkg" || opensuse_pkg_available "$pkg"; then
             out+=("$pkg")
         else
             miss+=("$pkg")
@@ -2214,10 +2264,10 @@ debian_ensure_quickshell() {
     fi
 
     local build_deps=(
-        build-essential cmake ninja-build pkg-config git spirv-tools vulkan-headers
+        build-essential cmake ninja-build pkg-config git spirv-tools libvulkan-dev
         wayland-protocols libwayland-dev qt6-base-dev qt6-base-private-dev
         qt6-declarative-dev qt6-declarative-private-dev qt6-wayland-dev
-        qt6-wayland-private-dev qt6-shadertools-dev libqt6svg6-dev libcli11-dev
+        qt6-wayland-private-dev qt6-shadertools-dev qt6-svg-dev qt6-svg-private-dev libcli11-dev
         libdrm-dev libgbm-dev libpipewire-0.3-dev libpam0g-dev
         libpolkit-agent-1-dev libglib2.0-dev libjemalloc-dev libxcb1-dev
     )
@@ -2754,7 +2804,8 @@ ensure_sddm_package() {
             return 0
         fi
 
-        run_root emerge --ask=n "${missing[@]}" || return 1
+        gentoo_autounmask_resolve "${missing[@]}" || true
+        run_root emerge --ask=n --noreplace --autounmask-continue "${missing[@]}" || return 1
     fi
 
     return 0
